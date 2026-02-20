@@ -12,8 +12,11 @@ import os
 import argparse
 import concurrent.futures
 import threading
+import time
+import signal
 from urllib.parse import urlparse
 import urllib3
+from datetime import datetime
 
 # Disable SSL warnings for self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -26,18 +29,74 @@ CYAN   = '\033[0;36m'
 NC     = '\033[0m'
 
 # --- Config ---
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 (0xsabir@wearehackerone.com)"
 TIMEOUT = 7
 MAX_THREADS = 50
 
 # --- Global Output Lock ---
 print_lock = threading.Lock()
 findings_lock = threading.Lock()
+file_lock = threading.Lock()
 findings = []  # Collect all results
+
+# --- Real-time output files (set in main) ---
+OUTPUT_LIVE_FILE = None      # Live hosts/subdomains
+OUTPUT_PORTS_FILE = None     # Live ports found open
+OUTPUT_FINDINGS_FILE = None  # Confirmed findings
+
+# Dedup sets for live hosts/ports
+seen_live_hosts = set()
+seen_live_ports = set()
+
+# --- Progress Tracker ---
+request_counter = 0
+counter_lock = threading.Lock()
+scan_start_time = None
+shutdown_flag = threading.Event()  # Clean Ctrl+C
+
+def increment_counter():
+    """Increment request counter and print progress."""
+    global request_counter
+    with counter_lock:
+        request_counter += 1
+        count = request_counter
+    # Print progress every 25 requests to avoid console spam
+    if count % 25 == 0:
+        elapsed = time.time() - scan_start_time if scan_start_time else 0
+        rate = count / elapsed if elapsed > 0 else 0
+        sys.stderr.write(f"\r\033[K\033[36m[PROGRESS] {count} requests sent | {rate:.0f} req/s | {elapsed:.0f}s elapsed\033[0m")
+        sys.stderr.flush()
 
 def safe_print(message):
     with print_lock:
         print(message)
+
+def write_to_output(filepath, line):
+    """Thread-safe append to output file in real-time."""
+    if not filepath:
+        return
+    with file_lock:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+def record_live_host(host):
+    """Record a live host/subdomain/IP to the live targets file."""
+    with file_lock:
+        if host not in seen_live_hosts:
+            seen_live_hosts.add(host)
+            if OUTPUT_LIVE_FILE:
+                with open(OUTPUT_LIVE_FILE, "a", encoding="utf-8") as f:
+                    f.write(host + "\n")
+
+def record_live_port(url, service_name):
+    """Record a live port to the ports file."""
+    key = url
+    with file_lock:
+        if key not in seen_live_ports:
+            seen_live_ports.add(key)
+            if OUTPUT_PORTS_FILE:
+                with open(OUTPUT_PORTS_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{url} [{service_name}]\n")
 
 def add_finding(severity, check_type, url, status, detail=""):
     with findings_lock:
@@ -48,6 +107,11 @@ def add_finding(severity, check_type, url, status, detail=""):
             "status": status,
             "detail": detail
         })
+    # Real-time write to findings file
+    line = f"[{severity}] [{check_type}] {url}"
+    if detail:
+        line += f" | {detail}"
+    write_to_output(OUTPUT_FINDINGS_FILE, line)
 
 # --- False Positive Detection ---
 # Common strings found on error/login/404 pages that indicate a soft-404 or redirect to auth
@@ -227,17 +291,36 @@ def check_url(url, check_type="Generic"):
     """
     Enhanced URL checker with false positive reduction.
     Uses allow_redirects=False to detect actual redirects properly.
+    Records live hosts and open ports in real-time.
     """
+    if shutdown_flag.is_set():
+        return False, url, 0
+    increment_counter()
     try:
         # First request: DON'T follow redirects to see the real status
         response = requests.get(
             url,
-            headers={"User-Agent": USER_AGENT},
+            headers=HEADERS,
             timeout=TIMEOUT,
             allow_redirects=False,
             verify=False
         )
         status = response.status_code
+
+        # --- Real-time recording: live host + open port ---
+        if status < 500:
+            try:
+                parsed = urlparse(url)
+                host = parsed.hostname or ""
+                port = parsed.port
+                # Record the host as live
+                if host:
+                    record_live_host(host)
+                # If there's a non-standard port, record it as a live port
+                if port and port not in (80, 443):
+                    record_live_port(f"{parsed.scheme}://{host}:{port}", check_type)
+            except:
+                pass
 
         # Handle redirects explicitly
         if status in [301, 302, 303, 307, 308]:
@@ -377,9 +460,12 @@ def scan_cloud_buckets(target_permutations):
 
 def check_firebase_db(name):
     """Check for open Firebase Realtime Databases with content validation."""
+    if shutdown_flag.is_set():
+        return
+    increment_counter()
     url = f"https://{name}.firebaseio.com/.json"
     try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, verify=False)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
         if r.status_code == 200:
             body = r.text.strip()
             # Firebase returns "null" for databases that exist but are empty
@@ -414,8 +500,11 @@ def check_jira(base_url, company):
     ]
 
     for j_url in jira_urls:
+        if shutdown_flag.is_set():
+            return
+        increment_counter()
         try:
-            r = requests.get(j_url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=False, verify=False)
+            r = requests.get(j_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, verify=False)
             if r.status_code in [200, 302, 301]:
                 safe_print(f"{GREEN}[+] JIRA INSTANCE FOUND -> {j_url} ({r.status_code}){NC}")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -1001,17 +1090,24 @@ def extract_company_from_domain(domain):
 def classify_input(raw):
     """
     Classify a single input string and return (input_type, company, domain, base_url).
-    input_type is one of: 'url', 'domain', 'company'
+    input_type is one of: 'url', 'domain', 'company', 'ip'
     """
     raw = raw.strip().rstrip("/")
     if not raw or raw.startswith("#"):
         return None, None, None, None
+
+    # IP address (IPv4)
+    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", raw):
+        return "ip", "ip-target", raw, f"https://{raw}"
 
     # URL
     if re.match(r"^https?://", raw):
         parsed = urlparse(raw)
         domain = parsed.hostname or ""
         base_url = f"{parsed.scheme}://{domain}"
+        # Check if hostname is an IP
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", domain):
+            return "ip", "ip-target", domain, base_url
         company = extract_company_from_domain(domain)
         return "url", company, domain, base_url
 
@@ -1027,54 +1123,72 @@ def classify_input(raw):
     return "company", company, None, None
 
 
-def run_scan_for_target(input_type, company, domain, base_url, permutations, checks):
-    """Run scan workflow for a single target. `checks` is a set of enabled categories."""
+def scan_single_target(input_type, domain, base_url, company, checks):
+    """Scan a single domain/IP — runs all check categories in PARALLEL."""
+    if shutdown_flag.is_set():
+        return
+
+    # --- For IP targets ---
+    if input_type == "ip":
+        ip = domain
+        bases = [f"https://{ip}", f"http://{ip}"]
+        tasks = []
+        for scan_base in bases:
+            if "web" in checks:
+                tasks.extend([
+                    lambda b=scan_base: check_app_vulns(b),
+                    lambda b=scan_base: check_unique_vulns(b),
+                    lambda b=scan_base: check_overlooked(b, ip),
+                    lambda b=scan_base: check_ai_ml(b),
+                ])
+            if "ports" in checks:
+                tasks.extend([
+                    lambda b=scan_base: check_databases(b, ip),
+                    lambda b=scan_base: check_infra_dashboards(b, ip),
+                ])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks) or 1) as ex:
+            list(ex.map(lambda fn: fn(), tasks))
+        return
+
+    # --- For domain/URL targets ---
+    scan_base = base_url
+    scan_domain = domain
+    tasks = []
+
+    if "web" in checks:
+        tasks.extend([
+            lambda: check_app_vulns(scan_base),
+            lambda: check_unique_vulns(scan_base),
+            lambda: check_jira(scan_base, company),
+            lambda: check_overlooked(scan_base, scan_domain),
+            lambda: check_ai_ml(scan_base),
+        ])
+
+    if "ports" in checks:
+        tasks.extend([
+            lambda: check_databases(scan_base, scan_domain),
+            lambda: check_infra_dashboards(scan_base, scan_domain),
+        ])
+
+    if tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+            list(ex.map(lambda fn: fn(), tasks))
+
+
+def run_company_group(company, targets_in_group, permutations, checks):
+    """
+    Run a full scan for one company group.
+    Bucket/SaaS run ONCE. Web/port run per unique subdomain.
+    targets_in_group is a list of (input_type, domain, base_url).
+    """
     safe_print(f"\n{CYAN}{'='*60}{NC}")
-    safe_print(f"{CYAN} Scanning: {company} | Type: {input_type}{NC}")
-    safe_print(f"{CYAN} Domain: {domain or 'auto-TLD'} | Base: {base_url or 'auto-TLD'}{NC}")
+    safe_print(f"{CYAN} Company Group: {company}{NC}")
+    safe_print(f"{CYAN} Subdomains/URLs: {len(targets_in_group)}{NC}")
     safe_print(f"{CYAN} Permutations: {len(permutations)}{NC}")
     safe_print(f"{CYAN} Checks: {', '.join(sorted(checks))}{NC}")
     safe_print(f"{CYAN}{'='*60}{NC}")
 
-    # --- If input_type is 'company', run TLD discovery first ---
-    base_urls_to_scan = []
-    domains_to_scan = []
-
-    if input_type == "company":
-        safe_print(f"\n{GREEN}--- Auto-TLD Discovery for '{company}' ---{NC}")
-        tld_results = []
-
-        def probe_tld(tld):
-            test_domain = f"{company}{tld}"
-            test_url = f"https://{test_domain}"
-            try:
-                r = requests.head(test_url, headers={"User-Agent": USER_AGENT},
-                                  timeout=5, allow_redirects=True, verify=False)
-                if r.status_code < 500:
-                    tld_results.append((test_domain, test_url))
-                    safe_print(f"{GREEN}  [+] LIVE: {test_url} ({r.status_code}){NC}")
-            except:
-                pass
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(probe_tld, COMMON_TLDS)
-
-        if tld_results:
-            for d, u in tld_results:
-                domains_to_scan.append(d)
-                base_urls_to_scan.append(u)
-            safe_print(f"{CYAN}[+] Found {len(tld_results)} live TLD(s){NC}")
-        else:
-            fallback_domain = f"{company}.com"
-            domains_to_scan.append(fallback_domain)
-            base_urls_to_scan.append(f"https://{fallback_domain}")
-            safe_print(f"{YELLOW}[!] No live TLDs found, falling back to {fallback_domain}{NC}")
-    else:
-        domains_to_scan.append(domain)
-        base_urls_to_scan.append(base_url)
-
-    # --- Run selected check categories ---
-
+    # --- 1. Bucket + Firebase (ONCE per company) ---
     if "buckets" in checks:
         scan_cloud_buckets(permutations)
         safe_print(f"\n{GREEN}--- Firebase DB Check ---{NC}")
@@ -1082,28 +1196,61 @@ def run_scan_for_target(input_type, company, domain, base_url, permutations, che
             futures = {executor.submit(check_firebase_db, perm): perm for perm in permutations}
             concurrent.futures.wait(futures)
 
-    for i, (scan_domain, scan_base) in enumerate(zip(domains_to_scan, base_urls_to_scan)):
-        if len(base_urls_to_scan) > 1:
-            safe_print(f"\n{CYAN}>>> Scanning domain [{i+1}/{len(base_urls_to_scan)}]: {scan_domain}{NC}")
-
-        if "web" in checks:
-            check_app_vulns(scan_base)
-            check_unique_vulns(scan_base)
-            check_jira(scan_base, company)
-            check_overlooked(scan_base, scan_domain)
-            check_ai_ml(scan_base)
-
-        if "ports" in checks:
-            check_databases(scan_base, scan_domain)
-            check_infra_dashboards(scan_base, scan_domain)
-
-        if "saas" in checks:
-            check_idp_cms(scan_base, company, permutations)
-            check_intigriti_mapper(scan_base, company, permutations)
-
+    # --- 2. SaaS/IdP (ONCE per company) ---
     if "saas" in checks:
+        first_base = targets_in_group[0][2] if targets_in_group else f"https://{company}.com"
         check_third_party(company, permutations)
-        check_saas_platforms(company, base_urls_to_scan[0] if base_urls_to_scan else f"https://{company}.com", permutations)
+        check_saas_platforms(company, first_base, permutations)
+        check_idp_cms(first_base, company, permutations)
+        check_intigriti_mapper(first_base, company, permutations)
+
+    # --- 3. Auto-TLD discovery for company-only entries ---
+    expanded_targets = []
+    for input_type, domain, base_url in targets_in_group:
+        if input_type == "company":
+            safe_print(f"\n{GREEN}--- Auto-TLD Discovery for '{company}' ---{NC}")
+            tld_results = []
+
+            def probe_tld(tld):
+                test_domain = f"{company}{tld}"
+                test_url = f"https://{test_domain}"
+                try:
+                    r = requests.head(test_url, headers=HEADERS,
+                                      timeout=5, allow_redirects=True, verify=False)
+                    if r.status_code < 500:
+                        tld_results.append((test_domain, test_url))
+                        safe_print(f"{GREEN}  [+] LIVE: {test_url} ({r.status_code}){NC}")
+                except:
+                    pass
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                executor.map(probe_tld, COMMON_TLDS)
+
+            if tld_results:
+                for d, u in tld_results:
+                    expanded_targets.append(("domain", d, u))
+                safe_print(f"{CYAN}[+] Found {len(tld_results)} live TLD(s){NC}")
+            else:
+                fallback = f"{company}.com"
+                expanded_targets.append(("domain", fallback, f"https://{fallback}"))
+                safe_print(f"{YELLOW}[!] No live TLDs found, falling back to {fallback}{NC}")
+        else:
+            expanded_targets.append((input_type, domain, base_url))
+
+    # --- 4. Dedup and run web/port per unique subdomain ---
+    seen_domains = set()
+    unique_targets = []
+    for t in expanded_targets:
+        key = t[1]  # domain or IP
+        if key not in seen_domains:
+            seen_domains.add(key)
+            unique_targets.append(t)
+
+    safe_print(f"\n{CYAN}[+] Scanning {len(unique_targets)} unique host(s) for {company}{NC}")
+    for i, (itype, dom, burl) in enumerate(unique_targets, 1):
+        if len(unique_targets) > 1:
+            safe_print(f"\n{CYAN}>>> [{i}/{len(unique_targets)}] {dom}{NC}")
+        scan_single_target(itype, dom, burl, company, checks)
 
 
 def print_summary():
@@ -1146,11 +1293,17 @@ Check category flags (optional - pick one or more):
 
   If NO category flag is given, ALL checks run by default.
 
+Smart grouping (auto with -list):
+  Targets auto-grouped by root company. Bucket/SaaS run ONCE per company.
+  Web/port checks run per unique subdomain. Duplicates are skipped.
+  e.g. dev.walmart.com + api.walmart.com = 1 bucket scan, 2 web scans.
+
 Examples:
   python bucket_finder.py -org uber                 Run ALL checks on uber
   python bucket_finder.py -org uber -p              Port scan only
-  python bucket_finder.py -org uber -p -b           Ports + buckets
-  python bucket_finder.py -list targets.txt -w -s   Web + SaaS on all targets
+  python bucket_finder.py -list subs.txt            Smart grouped full scan
+  python bucket_finder.py -list subs.txt -p         Ports only, grouped
+  python bucket_finder.py -list ips.txt -p -w       Ports + web on IPs
         """
     )
     parser.add_argument("-org", dest="org", help="Single target: company name, domain, or URL")
@@ -1159,6 +1312,7 @@ Examples:
     parser.add_argument("-b", dest="buckets", action="store_true", help="Cloud bucket + Firebase checks")
     parser.add_argument("-w", dest="web", action="store_true", help="Web app vulns (git, env, swagger, debug)")
     parser.add_argument("-s", dest="saas", action="store_true", help="SaaS & third-party checks")
+    parser.add_argument("-o", dest="output", help="Output file prefix (default: auto-generated)", default=None)
 
     # Backward compat positional
     parser.add_argument("target", nargs="?", help="Target (backward compat, same as -org)")
@@ -1180,8 +1334,8 @@ Examples:
     if not checks:
         checks = {"ports", "buckets", "web", "saas"}
 
-    # Determine targets
-    targets = []
+    # Determine raw targets
+    raw_targets = []
     if args.listfile:
         if not os.path.isfile(args.listfile):
             print(f"{RED}[!] File not found: {args.listfile}{NC}")
@@ -1190,50 +1344,127 @@ Examples:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    targets.append(line)
-        if not targets:
+                    raw_targets.append(line)
+        if not raw_targets:
             print(f"{RED}[!] No targets found in {args.listfile}{NC}")
             sys.exit(1)
-        safe_print(f"{CYAN}[+] Loaded {len(targets)} target(s) from {args.listfile}{NC}")
+        safe_print(f"{CYAN}[+] Loaded {len(raw_targets)} target(s) from {args.listfile}{NC}")
     elif args.org:
-        targets.append(args.org)
+        raw_targets.append(args.org)
     elif args.target:
-        targets.append(args.target)
+        raw_targets.append(args.target)
     else:
         parser.print_help()
         sys.exit(1)
 
-    safe_print(f"\n{CYAN}{'='*60}{NC}")
-    safe_print(f"{CYAN}  Enhanced Bucket & Misconfig Scanner v3.0{NC}")
-    safe_print(f"{CYAN}  Targets: {len(targets)} | Threads: {MAX_THREADS}{NC}")
-    safe_print(f"{CYAN}  Checks:  {', '.join(sorted(checks)).upper()}{NC}")
-    safe_print(f"{CYAN}{'='*60}{NC}")
+    # --- Initialize output files ---
+    global OUTPUT_LIVE_FILE, OUTPUT_PORTS_FILE, OUTPUT_FINDINGS_FILE
+    if args.output:
+        prefix = args.output
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = f"scan_{ts}"
 
-    for idx, raw_target in enumerate(targets, 1):
-        if len(targets) > 1:
-            safe_print(f"\n{CYAN}{'#'*60}{NC}")
-            safe_print(f"{CYAN}# TARGET [{idx}/{len(targets)}]: {raw_target}{NC}")
-            safe_print(f"{CYAN}{'#'*60}{NC}")
+    OUTPUT_LIVE_FILE = f"{prefix}_live.txt"
+    OUTPUT_PORTS_FILE = f"{prefix}_ports.txt"
+    OUTPUT_FINDINGS_FILE = f"{prefix}_findings.txt"
 
-        input_type, company, domain, base_url = classify_input(raw_target)
+    for fp in [OUTPUT_LIVE_FILE, OUTPUT_PORTS_FILE, OUTPUT_FINDINGS_FILE]:
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(f"# Scan started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    # --- Classify and group targets by company ---
+    from collections import OrderedDict
+    company_groups = OrderedDict()
+    ip_targets = []
+    seen_raw = set()
+
+    for raw in raw_targets:
+        raw_lower = raw.strip().lower()
+        if raw_lower in seen_raw:
+            continue
+        seen_raw.add(raw_lower)
+
+        input_type, company, domain, base_url = classify_input(raw)
         if input_type is None:
             continue
 
-        permutations = generate_permutations(company)
-        if input_type == "company":
-            safe_print(f"{GREEN}[+] Mode: ORG | Company: {company}{NC}")
-            safe_print(f"{CYAN}[+] Auto-TLD will probe: {', '.join(COMMON_TLDS[:8])}...{NC}")
-        elif input_type == "domain":
-            safe_print(f"{GREEN}[+] Mode: DOMAIN | {domain} (company: {company}){NC}")
+        if input_type == "ip":
+            ip_targets.append((domain, base_url))
         else:
-            safe_print(f"{GREEN}[+] Mode: URL | {base_url} (company: {company}){NC}")
-        safe_print(f"{CYAN}[+] Generated {len(permutations)} permutations{NC}")
+            if company not in company_groups:
+                company_groups[company] = []
+            company_groups[company].append((input_type, domain, base_url))
 
-        run_scan_for_target(input_type, company, domain, base_url, permutations, checks)
+    # --- Banner ---
+    safe_print(f"\n{CYAN}{'='*60}{NC}")
+    safe_print(f"{CYAN}  Enhanced Bucket & Misconfig Scanner v3.0{NC}")
+    safe_print(f"{CYAN}  Total inputs: {len(raw_targets)} | Unique: {len(seen_raw)}{NC}")
+    safe_print(f"{CYAN}  Company groups: {len(company_groups)}{NC}")
+    if ip_targets:
+        safe_print(f"{CYAN}  IP targets: {len(ip_targets)}{NC}")
+    safe_print(f"{CYAN}  Threads: {MAX_THREADS} | Checks: {', '.join(sorted(checks)).upper()}{NC}")
+    safe_print(f"{CYAN}  Output: {prefix}_*.txt{NC}")
+    safe_print(f"{CYAN}{'='*60}{NC}")
+
+    # Show grouping preview
+    for comp, tgts in company_groups.items():
+        safe_print(f"{GREEN}  [{comp}] -> {len(tgts)} target(s){NC}")
+    if ip_targets:
+        safe_print(f"{GREEN}  [IPs] -> {len(ip_targets)} target(s){NC}")
+
+    # --- Start timer ---
+    global scan_start_time
+    scan_start_time = time.time()
+
+    # --- Run per company group ---
+    for idx, (company, targets_in_group) in enumerate(company_groups.items(), 1):
+        safe_print(f"\n{CYAN}{'#'*60}{NC}")
+        safe_print(f"{CYAN}# COMPANY [{idx}/{len(company_groups)}]: {company} ({len(targets_in_group)} targets){NC}")
+        safe_print(f"{CYAN}{'#'*60}{NC}")
+
+        permutations = generate_permutations(company)
+        safe_print(f"{CYAN}[+] Generated {len(permutations)} permutations for '{company}'{NC}")
+
+        run_company_group(company, targets_in_group, permutations, checks)
+
+    # --- Run IP targets ---
+    if ip_targets:
+        safe_print(f"\n{CYAN}{'#'*60}{NC}")
+        safe_print(f"{CYAN}# IP TARGETS: {len(ip_targets)} IPs{NC}")
+        safe_print(f"{CYAN}{'#'*60}{NC}")
+
+        if "buckets" in checks:
+            safe_print(f"{YELLOW}[!] Bucket checks skipped for IP targets{NC}")
+        if "saas" in checks:
+            safe_print(f"{YELLOW}[!] SaaS checks skipped for IP targets{NC}")
+
+        for i, (ip, burl) in enumerate(ip_targets, 1):
+            safe_print(f"\n{CYAN}>>> IP [{i}/{len(ip_targets)}]: {ip}{NC}")
+            scan_single_target("ip", ip, burl, "ip-target", checks)
 
     # Final Summary
+    sys.stderr.write("\r\033[K")  # Clear progress line
+    elapsed = time.time() - scan_start_time if scan_start_time else 0
+    safe_print(f"\n{CYAN}[+] Scan completed: {request_counter} requests in {elapsed:.1f}s ({request_counter/elapsed:.0f} req/s){NC}" if elapsed > 0 else "")
     print_summary()
+
+    # Output file stats
+    safe_print(f"\n{CYAN}{'='*60}{NC}")
+    safe_print(f"{CYAN}  Output Files:{NC}")
+    safe_print(f"{CYAN}  Live hosts:  {OUTPUT_LIVE_FILE} ({len(seen_live_hosts)} hosts){NC}")
+    safe_print(f"{CYAN}  Live ports:  {OUTPUT_PORTS_FILE} ({len(seen_live_ports)} ports){NC}")
+    safe_print(f"{CYAN}  Findings:    {OUTPUT_FINDINGS_FILE} ({len(findings)} findings){NC}")
+    safe_print(f"{CYAN}{'='*60}{NC}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\r\033[K")
+        shutdown_flag.set()
+        elapsed = time.time() - scan_start_time if scan_start_time else 0
+        print(f"\n{YELLOW}[!] Scan interrupted by user after {request_counter} requests ({elapsed:.1f}s){NC}")
+        print(f"{CYAN}  Partial results saved to output files.{NC}")
+        sys.exit(0)
