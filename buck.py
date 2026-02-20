@@ -31,7 +31,8 @@ NC     = '\033[0m'
 # --- Config ---
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 (0xsabir@wearehackerone.com)"
 TIMEOUT = 7
-MAX_THREADS = 50
+MAX_THREADS = 30
+HOST_PARALLEL = 10  # How many hosts to scan simultaneously
 
 # --- Global Output Lock ---
 print_lock = threading.Lock()
@@ -50,6 +51,9 @@ seen_live_ports = set()
 
 # --- Progress Tracker ---
 request_counter = 0
+hosts_probed = 0
+hosts_alive = 0
+hosts_dead = 0
 counter_lock = threading.Lock()
 scan_start_time = None
 shutdown_flag = threading.Event()  # Clean Ctrl+C
@@ -60,12 +64,30 @@ def increment_counter():
     with counter_lock:
         request_counter += 1
         count = request_counter
-    # Print progress every 25 requests to avoid console spam
-    if count % 25 == 0:
+    # Print progress every 10 requests
+    if count % 10 == 0:
         elapsed = time.time() - scan_start_time if scan_start_time else 0
         rate = count / elapsed if elapsed > 0 else 0
-        sys.stderr.write(f"\r\033[K\033[36m[PROGRESS] {count} requests sent | {rate:.0f} req/s | {elapsed:.0f}s elapsed\033[0m")
+        sys.stderr.write(f"\r\033[K\033[36m[PROGRESS] {count} reqs | {rate:.0f}/s | {hosts_alive} live | {hosts_dead} dead | {elapsed:.0f}s\033[0m")
         sys.stderr.flush()
+
+
+def probe_host(url):
+    """Quick liveness check — fast HEAD request with short timeout."""
+    if shutdown_flag.is_set():
+        return False
+    global hosts_probed, hosts_alive, hosts_dead
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=3, allow_redirects=True, verify=False)
+        with counter_lock:
+            hosts_probed += 1
+            hosts_alive += 1
+        return True
+    except:
+        with counter_lock:
+            hosts_probed += 1
+            hosts_dead += 1
+        return False
 
 def safe_print(message):
     with print_lock:
@@ -1199,10 +1221,14 @@ def run_company_group(company, targets_in_group, permutations, checks):
     # --- 2. SaaS/IdP (ONCE per company) ---
     if "saas" in checks:
         first_base = targets_in_group[0][2] if targets_in_group else f"https://{company}.com"
-        check_third_party(company, permutations)
-        check_saas_platforms(company, first_base, permutations)
-        check_idp_cms(first_base, company, permutations)
-        check_intigriti_mapper(first_base, company, permutations)
+        saas_tasks = [
+            lambda: check_third_party(company, permutations),
+            lambda: check_saas_platforms(company, first_base, permutations),
+            lambda: check_idp_cms(first_base, company, permutations),
+            lambda: check_intigriti_mapper(first_base, company, permutations),
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda fn: fn(), saas_tasks))
 
     # --- 3. Auto-TLD discovery for company-only entries ---
     expanded_targets = []
@@ -1246,11 +1272,51 @@ def run_company_group(company, targets_in_group, permutations, checks):
             seen_domains.add(key)
             unique_targets.append(t)
 
-    safe_print(f"\n{CYAN}[+] Scanning {len(unique_targets)} unique host(s) for {company}{NC}")
-    for i, (itype, dom, burl) in enumerate(unique_targets, 1):
-        if len(unique_targets) > 1:
-            safe_print(f"\n{CYAN}>>> [{i}/{len(unique_targets)}] {dom}{NC}")
+    safe_print(f"\n{CYAN}[+] Probing {len(unique_targets)} unique host(s) for {company}...{NC}")
+
+    # --- Phase 1: Fast liveness probe (all hosts in parallel) ---
+    live_targets = []
+
+    def _probe(args):
+        itype, dom, burl = args
+        if shutdown_flag.is_set():
+            return None
+        is_live = probe_host(burl)
+        # Update progress on every probe
+        with counter_lock:
+            total = hosts_probed
+        if total % 50 == 0:
+            elapsed = time.time() - scan_start_time if scan_start_time else 0
+            sys.stderr.write(f"\r\033[K\033[36m[PROBE] {total}/{len(unique_targets)} probed | {hosts_alive} live | {hosts_dead} dead | {elapsed:.0f}s\033[0m")
+            sys.stderr.flush()
+        if is_live:
+            record_live_host(dom)
+            return (itype, dom, burl)
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=HOST_PARALLEL * 5) as ex:
+        results = list(ex.map(_probe, unique_targets))
+
+    live_targets = [r for r in results if r is not None]
+    sys.stderr.write("\r\033[K")  # Clear probe line
+    safe_print(f"{GREEN}[+] Liveness: {hosts_alive} alive / {hosts_dead} dead out of {len(unique_targets)} hosts{NC}")
+
+    if not live_targets:
+        safe_print(f"{YELLOW}[!] No live hosts found for {company} — skipping detailed checks{NC}")
+        return
+
+    # --- Phase 2: Run heavy checks only against live hosts ---
+    safe_print(f"{CYAN}[+] Running checks on {len(live_targets)} live host(s) ({HOST_PARALLEL} in parallel){NC}")
+
+    def _scan_host(args):
+        i, (itype, dom, burl) = args
+        if shutdown_flag.is_set():
+            return
+        safe_print(f"{CYAN}  [{i}/{len(live_targets)}] {dom}{NC}")
         scan_single_target(itype, dom, burl, company, checks)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=HOST_PARALLEL) as ex:
+        list(ex.map(_scan_host, enumerate(live_targets, 1)))
 
 
 def print_summary():
@@ -1439,14 +1505,23 @@ Examples:
         if "saas" in checks:
             safe_print(f"{YELLOW}[!] SaaS checks skipped for IP targets{NC}")
 
-        for i, (ip, burl) in enumerate(ip_targets, 1):
-            safe_print(f"\n{CYAN}>>> IP [{i}/{len(ip_targets)}]: {ip}{NC}")
+        def _scan_ip(args):
+            i, (ip, burl) = args
+            if shutdown_flag.is_set():
+                return
+            safe_print(f"{CYAN}  IP [{i}/{len(ip_targets)}]: {ip}{NC}")
             scan_single_target("ip", ip, burl, "ip-target", checks)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=HOST_PARALLEL) as ex:
+            list(ex.map(_scan_ip, enumerate(ip_targets, 1)))
 
     # Final Summary
     sys.stderr.write("\r\033[K")  # Clear progress line
     elapsed = time.time() - scan_start_time if scan_start_time else 0
-    safe_print(f"\n{CYAN}[+] Scan completed: {request_counter} requests in {elapsed:.1f}s ({request_counter/elapsed:.0f} req/s){NC}" if elapsed > 0 else "")
+    if elapsed > 0:
+        safe_print(f"\n{CYAN}[+] Scan completed in {elapsed:.1f}s{NC}")
+        safe_print(f"{CYAN}    Hosts probed: {hosts_probed} ({hosts_alive} alive, {hosts_dead} dead){NC}")
+        safe_print(f"{CYAN}    Requests sent: {request_counter} ({request_counter/elapsed:.0f} req/s){NC}")
     print_summary()
 
     # Output file stats
