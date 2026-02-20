@@ -14,6 +14,7 @@ import concurrent.futures
 import threading
 import time
 import signal
+import socket
 from urllib.parse import urlparse
 import urllib3
 from datetime import datetime
@@ -33,6 +34,11 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 TIMEOUT = 7
 MAX_THREADS = 30
 HOST_PARALLEL = 10  # How many hosts to scan simultaneously
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "X-Bug-Bounty": "0xsabir@wearehackerone.com",
+}
 
 # --- Global Output Lock ---
 print_lock = threading.Lock()
@@ -72,21 +78,54 @@ def increment_counter():
         sys.stderr.flush()
 
 
+probe_errors_logged = 0
+
 def probe_host(url):
-    """Quick liveness check — fast HEAD request with short timeout."""
+    """Quick liveness check using socket connection (port 443, then 80)."""
     if shutdown_flag.is_set():
         return False
-    global hosts_probed, hosts_alive, hosts_dead
+    global hosts_probed, hosts_alive, hosts_dead, probe_errors_logged
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        if not hostname:
+            with counter_lock:
+                hosts_probed += 1
+                hosts_dead += 1
+            return False
+    except:
+        with counter_lock:
+            hosts_probed += 1
+            hosts_dead += 1
+        return False
+
+    # Try TCP connect to port 443, then 80
+    for port in [443, 80]:
+        try:
+            sock = socket.create_connection((hostname, port), timeout=3)
+            sock.close()
+            with counter_lock:
+                hosts_probed += 1
+                hosts_alive += 1
+            return True
+        except:
+            pass
+
+    # Both ports failed — try HTTP HEAD as last resort
     try:
         r = requests.head(url, headers=HEADERS, timeout=3, allow_redirects=True, verify=False)
         with counter_lock:
             hosts_probed += 1
             hosts_alive += 1
         return True
-    except:
+    except Exception as e:
         with counter_lock:
             hosts_probed += 1
             hosts_dead += 1
+            # Log first 3 errors for debugging
+            if probe_errors_logged < 3:
+                probe_errors_logged += 1
+                safe_print(f"{YELLOW}[DEBUG] Probe failed for {hostname}: {type(e).__name__}: {e}{NC}")
         return False
 
 def safe_print(message):
@@ -347,13 +386,27 @@ def check_url(url, check_type="Generic"):
         # Handle redirects explicitly
         if status in [301, 302, 303, 307, 308]:
             location = response.headers.get("Location", "unknown")
-            # Check if redirect goes to a login page (common false positive)
+            if "Bucket" in check_type:
+                # AWS S3 and others redirect to regional endpoints if the bucket exists
+                safe_print(f"{YELLOW}[*] {check_type} EXISTS (Redirect) -> {url} => {location}{NC}")
+                add_finding("INFO", "Bucket Extists (Redirect)", url, status, f"Redirects to {location}")
+                return True, url, status
+            # Non-bucket checks
             if any(kw in location.lower() for kw in ["login", "signin", "auth", "sso", "account"]):
                 # Redirect to login = not a real finding, just skip silently
                 return False, url, status
             else:
                 safe_print(f"{YELLOW}[>] {check_type} REDIRECT ({status}) -> {url} => {location}{NC}")
                 return False, url, status
+
+        elif status == 400 and "Bucket" in check_type:
+            # AWS S3 sometimes returns 400 Bad Request if you hit a global endpoint for a bucket requiring a specific region
+            region = response.headers.get("x-amz-bucket-region")
+            if region or "The bucket you are attempting to access must be addressed using the specified endpoint" in response.text:
+                safe_print(f"{YELLOW}[*] {check_type} EXISTS but requires regional endpoint (400) -> {url} [Region: {region or 'unknown'}]{NC}")
+                add_finding("INFO", "Bucket Exists", url, status, f"Region: {region}")
+                return True, url, status
+            return False, url, status
 
         elif status == 200:
             content_type = response.headers.get("Content-Type", "")
@@ -425,48 +478,37 @@ def scan_cloud_buckets(target_permutations):
     urls_to_scan = []
 
     # Provider Templates
+    # By using GLOBAL endpoints we avoid 40+ redundant regional requests per permutation
     templates = [
-        # AWS
+        # AWS S3 (Global endpoint handles routing/redirects to regions)
         "https://{}.s3.amazonaws.com",
         "https://s3.amazonaws.com/{}",
-        "https://{}.s3.us-east-1.amazonaws.com",
-        "https://{}.s3.us-west-1.amazonaws.com",
-        "https://{}.s3.us-west-2.amazonaws.com",
-        # GCS
+        # GCS (Global)
         "https://storage.googleapis.com/{}",
         "https://{}.storage.googleapis.com",
         "https://firebasestorage.googleapis.com/v0/b/{}/o",
-        # Azure
+        # Azure (Global)
         "https://{}.blob.core.windows.net",
         "https://{}.blob.core.windows.net/?comp=list",
         "https://{}.blob.core.windows.net/public",
-        # Wasabi
-        "https://{}.s3.wasabisys.com",
     ]
 
-    # Regions
-    do_regions = ["nyc1", "nyc2", "nyc3", "ams2", "ams3", "sgp1", "lon1", "fra1", "tor1", "blr1", "sfo1", "sfo2", "sfo3"]
-    linode_regions = ["us-east-1", "us-southeast-1", "us-central-1", "us-west-1", "eu-central-1", "eu-west-1", "ap-south-1"]
-    alibaba_regions = ["cn-hangzhou", "cn-shanghai", "cn-qingdao", "cn-beijing", "cn-zhangjiakou", "cn-huhehaote", "cn-shenzhen", "cn-heyuan", "cn-guangzhou", "cn-chengdu", "cn-hongkong", "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-5", "ap-northeast-1", "ap-south-1", "eu-central-1", "eu-west-1", "us-west-1", "us-east-1", "me-east-1"]
-    tencent_regions = ["ap-beijing", "ap-guangzhou", "ap-shanghai", "ap-chengdu", "ap-chongqing", "ap-singapore", "ap-hongkong", "na-toronto", "na-siliconvalley", "eu-frankfurt"]
-    backblaze_regions = ["us-west-000", "us-west-001", "us-west-002", "us-east-003", "us-east-004", "eu-central-003"]
-
+    # For providers lacking global routing, we check the most common top regions
+    # (Checking 20+ regions per provider generates too much noise/slowness)
+    do_regions = ["nyc3", "ams3", "sgp1", "fra1"]       # Top 4 DigitalOcean
+    linode_regions = ["us-east-1", "eu-central-1"]      # Top 2 Linode
+    alibaba_regions = ["cn-hangzhou", "ap-southeast-1"] # Top 2 Alibaba
+    
     for region in do_regions:
         templates.append(f"https://{{}}.{region}.digitaloceanspaces.com")
     for region in linode_regions:
         templates.append(f"https://{{}}.{region}.linodeobjects.com")
     for region in alibaba_regions:
         templates.append(f"https://{{}}.oss-{region}.aliyuncs.com")
-        templates.append(f"https://{{}}.{region}.aliyuncs.com")
-    for region in tencent_regions:
-        templates.append(f"https://{{}}.cos.{region}.myqcloud.com")
-    for region in backblaze_regions:
-        templates.append(f"https://{{}}.s3.{region}.backblazeb2.com")
 
     # DreamHost & IBM
     templates.append("https://objects-us-east-1.dream.io/{}")
     templates.append("https://{}.s3.us.cloud-object-storage.appdomain.cloud")
-    templates.append("https://{}.s3.eu.cloud-object-storage.appdomain.cloud")
 
     for perm in target_permutations:
         for temp in templates:
@@ -552,21 +594,33 @@ def check_app_vulns(base_url):
         # Source Code Exposure (PROVEN HIGH BOUNTY)
         ("/.git/HEAD", "Git Repository"),
         ("/.git/config", "Git Config"),
-        # Secrets (PROVEN CRITICAL BOUNTY)
+        # Secrets & Credentials (PROVEN CRITICAL BOUNTY)
         ("/.env", "Environment File"),
         ("/.env.local", "Environment File"),
         ("/.env.bak", "Environment File"),
+        ("/.aws/credentials", "AWS Credentials"),
+        ("/.kube/config", "Kubernetes Config"),
+        ("/.ssh/id_rsa", "SSH Private Key"),
         ("/.vscode/sftp.json", "VSCode SFTP Config"),
         ("/sftp-config.json", "SFTP Config"),
-        ("/wp-config.php.bak", "Environment File"),
+        ("/wp-config.php.bak", "WP Config Backup"),
         ("/docker-compose.yml", "Docker Compose"),
+        ("/config/database.yml", "Rails DB Config"),
+        # Source Code & Config (PROVEN HIGH BOUNTY)
+        ("/.gitlab-ci.yml", "GitLab CI Config"),
+        ("/composer.json", "Composer Config"),
+        ("/package.json", "Node Package Config"),
+        ("/.svn/entries", "SVN Repository"),
         # Swagger/OpenAPI (PROVEN MEDIUM BOUNTY)
         ("/v2/api-docs", "Swagger Docs"),
         ("/swagger.json", "Swagger Docs"),
         ("/swagger-ui.html", "Swagger UI"),
         ("/swagger-ui/", "Swagger UI"),
         ("/api-docs", "Swagger Docs"),
-        # Debug (PROVEN HIGH BOUNTY)
+        # Debug & Status (PROVEN HIGH/CRITICAL BOUNTY)
+        ("/console", "Werkzeug Debug Console (RCE)"),
+        ("/phpinfo.php", "PHP Info"),
+        ("/server-status", "Apache Server Status"),
         ("/_debugbar/open", "Laravel Debug"),
         ("/telescope/requests", "Laravel Telescope"),
         # Source Maps (PROVEN INFO DISCLOSURE)
@@ -601,29 +655,18 @@ def check_unique_vulns(base_url):
         concurrent.futures.wait(futures)
 
 
-def check_third_party(company, permutations):
-    """Third-party checks with permutation support for subdomain-based services."""
-    safe_print(f"\n{GREEN}--- Third-Party Integrations (Permutated) ---{NC}")
+def check_third_party(company, saas_perms):
+    """Third-party checks using focused SaaS permutations ONLY."""
+    safe_print(f"\n{GREEN}--- Third-Party Integrations (Targeted) ---{NC}")
 
     urls = []
-    # Path-based (use company only)
-    urls.append((f"https://trello.com/b/{company}", "Trello Board"))
-    urls.append((f"https://trello.com/{company}", "Trello Profile"))
-    urls.append((f"https://www.postman.com/{company}", "Postman Workspace"))
-    urls.append((f"https://circleci.com/gh/{company}", "CircleCI"))
-    urls.append((f"https://travis-ci.org/{company}", "Travis CI (org)"))
-    urls.append((f"https://travis-ci.com/{company}", "Travis CI (com)"))
-    urls.append((f"https://dev.azure.com/{company}", "Azure DevOps Org"))
-
-    # Subdomain-based (use permutations for broader coverage)
-    for perm in permutations:
+    # High-value Subdomain-based SaaS
+    for perm in saas_perms:
         urls.append((f"https://{perm}.zendesk.com", "Zendesk"))
-        urls.append((f"https://{perm}.notion.site", "Notion Site"))
         urls.append((f"https://{perm}.slack.com", "Slack Workspace"))
         urls.append((f"https://{perm}.atlassian.net", "Atlassian Cloud"))
         urls.append((f"https://{perm}.atlassian.net/wiki", "Confluence"))
         urls.append((f"https://sonar.{perm}.com", "SonarQube"))
-        urls.append((f"https://sonarqube.{perm}.com", "SonarQube Alt"))
 
     safe_print(f"{CYAN}[*] Testing {len(urls)} third-party URLs{NC}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
@@ -738,6 +781,10 @@ def check_infra_dashboards(base_url, domain):
         # RabbitMQ Management (HIGH — queue data)
         (f"{base_url}:15672/", "RabbitMQ"),
         (f"https://rabbitmq.{domain}", "RabbitMQ"),
+        # Apache ActiveMQ (CRITICAL — RCE via PUT)
+        (f"{base_url}:8161/admin/", "ActiveMQ Admin"),
+        # Apache Storm (CRITICAL — RCE via Topology)
+        (f"{base_url}:8080/api/v1/cluster/configuration", "Apache Storm UI"),
         # Prometheus (HIGH — internal metrics/secrets)
         (f"{base_url}:9090/", "Prometheus"),
         (f"{base_url}:9090/graph", "Prometheus"),
@@ -746,7 +793,10 @@ def check_infra_dashboards(base_url, domain):
         # Kubernetes Dashboard (CRITICAL)
         (f"{base_url}:8443/", "Kubernetes Dashboard"),
         (f"{base_url}:10250/pods", "Kubelet API"),
+        (f"{base_url}:10255/pods", "Kubelet Read-Only API (Unauth)"),
         (f"https://dashboard.{domain}", "Kubernetes Dashboard"),
+        # cAdvisor (HIGH — container metrics)
+        (f"{base_url}:4194/", "cAdvisor Node Metrics"),
         # Docker API (CRITICAL — full container RCE)
         (f"{base_url}:2375/containers/json", "Docker API (Unauth)"),
         (f"{base_url}:2376/containers/json", "Docker API (TLS)"),
@@ -775,6 +825,12 @@ def check_infra_dashboards(base_url, domain):
         # Flower / Celery (HIGH — task queue monitoring)
         (f"{base_url}:5555/", "Celery Flower"),
         (f"https://flower.{domain}", "Celery Flower"),
+        # Apache NiFi (CRITICAL — data flow RCE)
+        (f"{base_url}:8080/nifi/", "Apache NiFi"),
+        (f"{base_url}:8443/nifi/", "Apache NiFi HTTPS"),
+        # Spring Boot Admin (HIGH — multi-app management)
+        (f"{base_url}:8080/applications", "Spring Boot Admin"),
+        (f"https://spring-admin.{domain}", "Spring Boot Admin"),
         # Airflow (HIGH — DAG execution / RCE)
         (f"{base_url}:8080/admin/", "Airflow Admin"),
         (f"{base_url}:8080/api/v1/dags", "Airflow DAGs API"),
@@ -821,10 +877,11 @@ def check_infra_dashboards(base_url, domain):
         # Flink (HIGH — job execution / data processing)
         (f"{base_url}:8081/", "Apache Flink"),
         (f"{base_url}:8081/#/overview", "Apache Flink Dashboard"),
-        # Spark (HIGH — job data / RCE via submit)
-        (f"{base_url}:4040/", "Spark UI"),
-        (f"{base_url}:8080/json/", "Spark Master"),
-        (f"{base_url}:18080/", "Spark History"),
+        # Spark (CRITICAL — job data / RCE via submit)
+        (f"{base_url}:4040/", "Spark Jobs UI (Unauth)"),
+        (f"{base_url}:8080/json/", "Spark Master UI (Unauth)"),
+        (f"{base_url}:8081/", "Spark Worker UI (Unauth)"),
+        (f"{base_url}:18080/", "Spark History Server"),
         # Couchbase (CRITICAL — full data access)
         (f"{base_url}:8091/", "Couchbase Console"),
         (f"{base_url}:8091/pools/default/buckets", "Couchbase Buckets"),
@@ -832,6 +889,10 @@ def check_infra_dashboards(base_url, domain):
         (f"{base_url}:6379/", "Redis"),
         # Memcached (HIGH — cache data dump)
         (f"{base_url}:11211/", "Memcached"),
+        # ArangoDB (CRITICAL — unauth DB access)
+        (f"{base_url}:8529/", "ArangoDB Web UI"),
+        # RethinkDB (CRITICAL — unauth DB access)
+        (f"{base_url}:8080/#/", "RethinkDB Web UI"),
         # NATS Monitoring (HIGH — messaging infra)
         (f"{base_url}:8222/", "NATS Monitoring"),
         (f"{base_url}:8222/connz", "NATS Connections"),
@@ -995,22 +1056,18 @@ def check_infra_dashboards(base_url, domain):
         concurrent.futures.wait(futures)
 
 
-def check_saas_platforms(company, base_url, permutations):
-    """Enterprise SaaS & IdP checks with permutation support."""
-    safe_print(f"\n{GREEN}--- Enterprise SaaS & IdP (Permutated) ---{NC}")
+def check_saas_platforms(base_url, saas_perms):
+    """Enterprise SaaS & IdP checks using focused SaaS permutations."""
+    safe_print(f"\n{GREEN}--- Enterprise SaaS & IdP (Targeted) ---{NC}")
 
     checks = []
-    # Base URL checks (no permutation needed)
     checks.append((f"{base_url}/app/etc/local.xml", "Magento Config Leak"))
 
-    # Subdomain-based checks (use permutations)
-    for perm in permutations:
+    for perm in saas_perms:
         checks.append((f"https://{perm}.service-now.com/kb_view.do", "ServiceNow KB"))
         checks.append((f"https://{perm}.service-now.com/sp_widget_list.do", "ServiceNow Widgets"))
         checks.append((f"https://{perm}.my.salesforce.com/aura", "Salesforce Lightning"))
-        checks.append((f"https://{perm}.force.com", "Salesforce Sites"))
         checks.append((f"https://auth.{perm}.com/auth/realms/master/.well-known/openid-configuration", "Keycloak Realm"))
-        checks.append((f"https://gitlab.{perm}.com/explore", "GitLab Explore"))
         checks.append((f"https://{perm}.okta.com/.well-known/openid-configuration", "Okta Tenant"))
         checks.append((f"https://{perm}.auth0.com/.well-known/openid-configuration", "Auth0 Tenant"))
 
@@ -1020,19 +1077,17 @@ def check_saas_platforms(company, base_url, permutations):
         concurrent.futures.wait(futures)
 
 
-def check_idp_cms(base_url, company, permutations):
-    """IdP and CMS Logic checks with permutation support."""
-    safe_print(f"\n{GREEN}--- IdP & CMS Logic (Permutated) ---{NC}")
+def check_idp_cms(base_url, saas_perms):
+    """IdP and CMS Logic checks using focused SaaS permutations."""
+    safe_print(f"\n{GREEN}--- IdP & CMS Logic (Targeted) ---{NC}")
 
     checks = []
-    # Base URL checks
     checks.append((f"{base_url}/wp-json/wp/v2/users", "WordPress Users"))
     checks.append((f"{base_url}/wp-admin/setup-config.php", "WordPress Setup"))
     checks.append((f"{base_url}/core/install.php", "Drupal Installer"))
     checks.append((f"{base_url}/user/register", "Drupal Registration"))
 
-    # Subdomain-based (permutated)
-    for perm in permutations:
+    for perm in saas_perms:
         checks.append((f"https://{perm}.okta.com/api/v1/users", "Okta API Users"))
         checks.append((f"https://auth.{perm}.com/auth/realms/master/account/", "Keycloak Registration"))
 
@@ -1041,21 +1096,17 @@ def check_idp_cms(base_url, company, permutations):
         concurrent.futures.wait(futures)
 
 
-def check_intigriti_mapper(base_url, company, permutations):
-    """Intigriti mapper with permutation support."""
-    safe_print(f"\n{GREEN}--- Intigriti Mapper Targets (Permutated) ---{NC}")
+def check_intigriti_mapper(base_url, saas_perms):
+    """Intigriti mapper with focused SaaS permutations."""
+    safe_print(f"\n{GREEN}--- Intigriti Mapper Targets (Targeted) ---{NC}")
 
     checks = []
-    # Base URL checks
     checks.append((f"{base_url}/telescope/requests", "Laravel Telescope"))
     checks.append((f"{base_url}/jenkins/signup", "Jenkins Signup (Path)"))
-    checks.append((f"{base_url}/jenkins/script", "Jenkins Script Console (Path)"))
 
-    # Subdomain-based (permutated)
-    for perm in permutations:
+    for perm in saas_perms:
         checks.append((f"https://{perm}.freshservice.com/support/signup", "Freshservice Signup"))
         checks.append((f"https://jenkins.{perm}.com/signup", "Jenkins Signup"))
-        checks.append((f"https://jenkins.{perm}.com/script", "Jenkins Script Console"))
         checks.append((f"https://gitlab.{perm}.com/explore/snippets", "GitLab Snippets"))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
@@ -1220,12 +1271,19 @@ def run_company_group(company, targets_in_group, permutations, checks):
 
     # --- 2. SaaS/IdP (ONCE per company) ---
     if "saas" in checks:
+        # High-probability SaaS subdomains (avoid 500+ permutations for strict APIs)
+        saas_perms = [
+            company, f"{company}-dev", f"{company}-sandbox", f"{company}-qa",
+            f"{company}-staging", f"{company}-sso", f"corp-{company}", 
+            f"{company}-corp", f"dev-{company}", f"sso-{company}"
+        ]
+        
         first_base = targets_in_group[0][2] if targets_in_group else f"https://{company}.com"
         saas_tasks = [
-            lambda: check_third_party(company, permutations),
-            lambda: check_saas_platforms(company, first_base, permutations),
-            lambda: check_idp_cms(first_base, company, permutations),
-            lambda: check_intigriti_mapper(first_base, company, permutations),
+            lambda: check_third_party(company, saas_perms),
+            lambda: check_saas_platforms(first_base, saas_perms),
+            lambda: check_idp_cms(first_base, saas_perms),
+            lambda: check_intigriti_mapper(first_base, saas_perms),
         ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             list(ex.map(lambda fn: fn(), saas_tasks))
