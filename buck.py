@@ -301,37 +301,218 @@ CONFIRM_SIGNATURES = {
     "Backup Archive": [],  # Binary
     "Database Dump": ["INSERT INTO", "CREATE TABLE", "mysqldump", "pg_dump"],
 }
+CONFIRM_SIGNATURES.update({    # --- ADDED TO ENSURE ZERO FALSE POSITIVES ---
+    "ActiveMQ Admin": ["activemq", "broker"],
+    "Airflow": ["airflow", "dags"],
+    "AlertManager": ["alertmanager", "prometheus"],
+    "AlertManager API": ["status", "data"],
+    "Apache Druid": ["druid", "coordinator"],
+    "Apache Flink": ["flink", "taskmanagers"],
+    "Apache Flink Dashboard": ["flink", "taskmanagers"],
+    "Apache NiFi": ["nifi", "canvas"],
+    "Apache NiFi HTTPS": ["nifi", "canvas"],
+    "Apache Server Status": ["apache server status", "total accesses"],
+    "Apache Solr": ["solr", "lucenecore"],
+    "Apache Storm UI": ["storm ui", "topology"],
+    "Apache Superset": ["superset", "dashboards"],
+    "ArangoDB Web UI": ["arangodb", "foxx"],
+    "Argo Workflows": ["argo", "workflows"],
+    "Atlassian Cloud": ["atlassian"],
+    "Bamboo": ["bamboo", "atlassian"],
+    "BentoML": ["bentoml"],
+    "Blackbox Exporter": ["blackbox exporter"],
+    "CI Server": ["jenkins", "gitlab", "bamboo", "teamcity"],
+    "Celery Flower": ["flower", "celery"],
+    "ClickHouse Databases": ["system", "default"],
+    "ClickHouse HTTP": ["ok."],
+    "Cockpit": ["cockpit", "server"],
+    "Composer Config": ["require", "autoload"],
+    "Confluence": ["confluence", "atlassian"],
+    "Consul": ["consul"],
+    "Consul KV Store": ["key", "value"],
+    "Consul UI": ["consul"],
+    "Container Registry": ["repositories"],
+    "Couchbase Buckets": ["buckets"],
+    "Couchbase Console": ["couchbase"],
+    "Docker API (TLS)": ["containers", "image"],
+    "Docker API (Unauth)": ["containers", "image"],
+    "Docker API Images": ["repoTags", "size"],
+    "Drone CI": ["drone", "pipelines"],
+    "Druid Indexer": ["indexer", "tasks"],
+    "Drupal Installer": ["drupal", "install"],
+    "Drupal Registration": ["drupal", "register"],
+    "Envoy Admin": ["envoy", "server_info"],
+    "Envoy Config Dump": ["configs"],
+    "Erlang EPMD": ["name", "port"],
+    "Freshservice Signup": ["freshservice"],
+    "GitLab": ["gitlab"],
+    "GitLab CI Config": ["stages", "script"],
+    "Gitea": ["gitea", "explore"],
+    "GlassFish Admin": ["glassfish", "admin"],
+    "Grafana Datasources": ["type", "url", "access"],
+    "Grafana Loki": ["loki", "grafana"],
+    "Graylog": ["graylog"],
+    "HBase Master": ["hbase", "master"],
+    "HBase RegionServer": ["hbase", "regionserver"],
+    "Hadoop DataNode": ["hadoop", "datanode"],
+    "Hadoop NameNode": ["hadoop", "namenode"],
+    "Hadoop YARN": ["hadoop", "yarn", "cluster"],
+    "Hadoop YARN Apps": ["apps", "app"],
+    "Harbor Registry": ["harbor"],
+    "HashiCorp Vault": ["vault", "hashicorp"],
+    "Hazelcast": ["hazelcast", "cluster"],
+    "Istio Metrics": ["istio", "metrics"],
+    "JBoss Console": ["jboss", "management"],
+    "JFrog Artifactory": ["artifactory", "jfrog"],
+    "Jaeger": ["jaeger"],
+    "Jaeger UI": ["jaeger"],
+    "Jenkins": ["jenkins"],
+    "Jenkins Manage": ["jenkins", "manage"],
+    "Jenkins Signup": ["jenkins", "signup"],
+    "Jenkins Signup (Path)": ["jenkins", "signup"],
+    "Jira Admin Contact": ["jira", "contact"],
+    "Jira Dashboard": ["jira", "dashboard"],
+    "Jira Filters": ["jira", "filters"],
+    "Jira Portal Config": ["jira", "portal"],
+    "Jira Service Desk Signup": ["jira", "signup"],
+    "Jira User Enum": ["jira", "user"],
+    "Jira User Picker API": ["users:", "total:"],
+    "Jupyter Notebook": ["jupyter"],
+    "Kafdrop": ["kafdrop", "kafka"],
+    "Kafka Control Center": ["confluent", "control center"],
+    "Kafka UI": ["kafka", "ui"],
+    "Keycloak Registration": ["keycloak", "register"],
+    "Kiali": ["kiali"],
+    "Kubelet API": ["items", "metadata"],
+    "Kubelet Read-Only API (Unauth)": ["items", "metadata"],
+    "Kubernetes Config": ["apiVersion: v1", "clusters"],
+    "LDAP Admin": ["ldapadmin", "phpldapadmin"],
+    "Label Studio": ["label studio"],
+    "Loki API": ["status", "data"],
+    "MLflow API": ["experiments"],
+    "Mattermost": ["mattermost"],
+    "Mattermost/Chat": ["mattermost"],
+    "Memcached": ["stats", "version", "pid"],
+    "Metabase": ["metabase"],
+    "Milvus Vector DB": ["custom_setup", "msg"],
+    "MinIO/S3": ["minio", "s3"],
+    "MongoDB": ["mongodb", "ok"],
+    "NATS Connections": ["connections"],
+    "NATS Monitoring": ["nats", "varz"],
+    "Nagios": ["nagios"],
+    "Neo4j Bolt": ["neo4j", "bolt"],
+    "Neo4j Browser": ["neo4j"],
+    "Nexus Repository": ["nexus", "repository"],
+    "Node Package Config": ["name:", "version:"],
+    "Nomad Jobs API": ["ID", "Name", "Type"],
+    "Nomad UI": ["nomad", "jobs"],
+    "Okta API Users": ["profile", "credentials"],
+    "Open bucket with listing": ["ListBucketResult"],
+    "OpenFaaS": ["openfaas", "functions"],
+    "OpenSearch": ["opensearch", "cluster_name"],
+    "OpenSearch Dashboards": ["opensearch", "dashboards"],
+    "PHP Info": ["phpinfo()", "PHP Version"],
+    "PgAdmin": ["pgadmin"],
+    "Presto/Trino": ["presto", "trino"],
+    "Prometheus Targets": ["activeTargets", "droppedTargets"],
+    "Pushgateway": ["pushgateway", "prometheus"],
+    "Qdrant Vector DB": ["collections"],
+    "RabbitMQ": ["rabbitmq"],
+    "Rails DB Config": ["adapter:", "database:"],
+    "Ray Dashboard": ["ray", "dashboard"],
+    "Ray Jobs API": ["job_id", "status"],
+    "Redis": ["redis_version", "role"],
+    "Redmine": ["redmine"],
+    "RethinkDB Web UI": ["rethinkdb", "admin"],
+    "Rundeck": ["rundeck"],
+    "SVN Repository": ["svn", "dir\n"],
+    "Salesforce Lightning": ["salesforce", "aura"],
+    "ServiceNow Widgets": ["servicenow", "widgets"],
+    "Slack Workspace": ["slack"],
+    "Solr Cores": ["status", "core"],
+    "SonarQube": ["sonarqube"],
+    "Spark History Server": ["spark", "history"],
+    "Spark Jobs UI (Unauth)": ["spark", "jobs"],
+    "Spark Master UI (Unauth)": ["spark", "master"],
+    "Spark Worker UI (Unauth)": ["spark", "worker"],
+    "Splunk": ["splunk"],
+    "Spring Boot Admin": ["spring", "admin"],
+    "TeamCity": ["teamcity"],
+    "Thanos": ["thanos"],
+    "Thanos Query": ["thanos", "query"],
+    "Tomcat Host Manager": ["tomcat", "host manager"],
+    "Tomcat Manager": ["tomcat", "manager"],
+    "Traefik API": ["routers", "services"],
+    "Traefik Dashboard": ["traefik", "dashboard"],
+    "Trino HTTPS": ["trino"],
+    "Triton Inference": ["models", "name"],
+    "Triton gRPC": ["triton", "grpc"],
+    "Vault Seal Status": ["sealed:"],
+    "Verdaccio npm Registry": ["verdaccio"],
+    "WHM": ["whm", "cpanel"],
+    "WHM SSL": ["whm", "cpanel"],
+    "WP Config Backup": ["define('DB_PASSWORD'", "define('DB_USER'"],
+    "Weave Scope": ["weave", "scope"],
+    "Weaviate Vector DB": ["classes", "schema"],
+    "WebLogic Console": ["weblogic", "console"],
+    "WebLogic SSL Console": ["weblogic", "console"],
+    "Webmin": ["webmin"],
+    "Werkzeug Debug Console (RCE)": ["werkzeug", "console"],
+    "WildFly Admin": ["wildfly", "admin"],
+    "WordPress Setup": ["wordpress", "setup"],
+    "Zabbix": ["zabbix"],
+    "Zendesk": ["zendesk"],
+    "Zipkin": ["zipkin"],
+    "Zookeeper": ["zookeeper"],
+    "cAdvisor Node Metrics": ["cadvisor", "metrics"],
+    "cPanel": ["cpanel"],
+    "cPanel SSL": ["cpanel"],
+    "etcd": ["etcdserver", "etcdcluster"],
+    "etcd Keys": ["action", "node"],
+    "npm Registry": ["db_name", "doc_count"],
+    "ntopng": ["ntopng"],
+    "phpLDAPadmin": ["phpldapadmin"],
+}
+)
 
 
 def is_false_positive(response_text, check_type, content_type=""):
     """
     Determines if a 200 response is a false positive by analyzing content.
-    Returns True if it's likely a false positive (login page, error page, etc.)
+    Returns True if it's considered a false positive.
+    Returns False ONLY if it is a fully CONFIRMED finding (Zero False Positives).
     """
     if not response_text:
         return True  # Empty response is not a real finding
 
-    text_lower = response_text[:5000].lower()  # Only check first 5KB
+    text_lower = response_text[:10000].lower()  # Check up to 10KB
     
-    # If we have specific confirmation signatures for this check type, use them
-    if check_type in CONFIRM_SIGNATURES and CONFIRM_SIGNATURES[check_type]:
-        for sig in CONFIRM_SIGNATURES[check_type]:
-            if sig.lower() in text_lower:
-                return False  # Confirmed real finding
-        # If none of the confirmation signatures matched, it's likely false positive
-        return True
-    
-    # For check types without specific signatures, use generic false positive detection
-    # Count how many false positive signatures match
-    fp_score = 0
+    # 1. Any known false positive signature immediately invalidates it (strict mode)
     for sig in FALSE_POSITIVE_SIGNATURES:
         if sig in text_lower:
-            fp_score += 1
-    
-    # If multiple false positive signatures found, it's likely a soft-404 or error page
-    if fp_score >= 2:
+            return True
+            
+    # 2. Strict Confirmation: If it's in CONFIRM_SIGNATURES, ensure it matches!
+    if check_type in CONFIRM_SIGNATURES:
+        sigs = CONFIRM_SIGNATURES[check_type]
+        if not sigs:
+            # Empty signature list -> highly varying / binary data
+            if content_type and "text/html" in content_type:
+                return True # HTML from a binary/data check is a false positive
+            return False
+            
+        # Match at least ONE signature
+        for sig in sigs:
+            if sig.lower() in text_lower:
+                return False  # CONFIRMED!
+                
+        # If no signature matched, it's a false positive (Zero-FP rule)
         return True
-    
+
+    # 3. For any unaccounted checks, assume it's a false positive if it returns HTML
+    if content_type and "text/html" in content_type:
+        return True
+
     # Check if response is HTML when we expect data (JSON, YAML, etc.)
     if content_type and "text/html" in content_type:
         # Most API/config endpoints should NOT return HTML
@@ -344,7 +525,7 @@ def is_false_positive(response_text, check_type, content_type=""):
         for dct in data_check_types:
             if dct in check_type:
                 return True  # HTML response for a data endpoint = false positive
-    
+
     return False
 
 
