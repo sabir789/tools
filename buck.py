@@ -214,9 +214,17 @@ CONFIRM_SIGNATURES = {
     "AWS Credentials": ["aws_access_key_id", "aws_secret_access_key"],
     "Htpasswd": ["$apr1$", "{SHA}", "$2y$"],
     # --- Spring Boot ---
-    "Spring Boot Actuator": ['"status":', '"beans":', '"contextId":'],
+    "Spring Boot Actuator": {
+        "condition": "or",
+        "words": ['"status":', '"beans":', '"contextId":'],
+        "headers": {"content-type": "json"}
+    },
     "Spring Boot Heapdump": [],  # Binary file
-    "Spring Boot Env": ['"propertySources":', '"activeProfiles":'],
+    "Spring Boot Env": {
+        "condition": "or",
+        "words": ['"propertySources":', '"activeProfiles":'],
+        "headers": {"content-type": "json"}
+    },
     "Spring Boot Gateway Routes": ['"route_id":', '"predicates":'],
     "Spring Boot Metrics": ['"names":', '"jvm.memory'],
     "Spring Boot Mappings": ['"dispatcherServlets":', '"handler":'],
@@ -262,7 +270,11 @@ CONFIRM_SIGNATURES = {
     "Airflow Admin": ["airflow", "DAGs"],
     "Airflow DAGs API": ['"dags":', '"dag_id":'],
     "TensorBoard": ['"logdir"'],
-    "Jupyter": ["jupyter", "Jupyter"],
+    "Jupyter": {
+        "condition": "and",
+        "words": ["jupyter"],
+        "regex": [r"data-base-url"]
+    },
     "OpenAI Config": ["sk-", "api_key", "openai"],
     # --- CMS / Frameworks ---
     "Laravel Telescope": ["telescope", "Telescope"],
@@ -476,7 +488,7 @@ CONFIRM_SIGNATURES.update({    # --- ADDED TO ENSURE ZERO FALSE POSITIVES ---
 )
 
 
-def is_false_positive(response_text, check_type, content_type=""):
+def is_false_positive(response_text, check_type, content_type="", headers=None, status_code=200):
     """
     Determines if a 200 response is a false positive by analyzing content.
     Returns True if it's considered a false positive.
@@ -500,14 +512,51 @@ def is_false_positive(response_text, check_type, content_type=""):
             if content_type and "text/html" in content_type:
                 return True # HTML from a binary/data check is a false positive
             return False
-            
-        # Match at least ONE signature
-        for sig in sigs:
-            if sig.lower() in text_lower:
-                return False  # CONFIRMED!
-                
-        # If no signature matched, it's a false positive (Zero-FP rule)
-        return True
+
+        if isinstance(sigs, dict):
+            # Nuclei-style matcher
+            condition = sigs.get("condition", "or").lower()
+            words = sigs.get("words", [])
+            regexes = sigs.get("regex", [])
+            expected_headers = sigs.get("headers", {})
+            expected_status = sigs.get("status", [])
+
+            if expected_status and status_code not in expected_status:
+                return True
+
+            if expected_headers:
+                if not headers:
+                    return True
+                headers_lower = {k.lower(): v.lower() for k, v in headers.items()}
+                for h_k, h_v in expected_headers.items():
+                    actual_v = headers_lower.get(h_k.lower(), "")
+                    if h_v.lower() not in actual_v:
+                        return True
+
+            matched_words = [w for w in words if w.lower() in text_lower]
+            matched_regexes = [r for r in regexes if re.search(r, text_lower, re.IGNORECASE)]
+
+            total_matched = len(matched_words) + len(matched_regexes)
+            total_required = len(words) + len(regexes)
+
+            if total_required > 0:
+                if condition == "and":
+                    if total_matched < total_required:
+                        return True
+                else: # condition == "or"
+                    if total_matched == 0:
+                        return True
+
+            return False  # CONFIRMED!
+
+        else:
+            # Match at least ONE signature
+            for sig in sigs:
+                if sig.lower() in text_lower:
+                    return False  # CONFIRMED!
+                    
+            # If no signature matched, it's a false positive (Zero-FP rule)
+            return True
 
     # 3. For any unaccounted checks, assume it's a false positive if it returns HTML
     if content_type and "text/html" in content_type:
@@ -613,14 +662,14 @@ def check_url(url, check_type="Generic"):
                     return False, url, status  # Empty = likely doesn't exist
                 else:
                     # Generic 200 for bucket - could be anything, validate content
-                    if is_false_positive(body, check_type, content_type):
+                    if is_false_positive(body, check_type, content_type, response.headers, status):
                         return False, url, status
                     safe_print(f"{RED}[!!!] {check_type} FOUND (200) -> {url}{NC}")
                     add_finding("HIGH", check_type, url, status)
                     return True, url, status
             else:
                 # Non-bucket checks: validate content to reduce false positives
-                if is_false_positive(body, check_type, content_type):
+                if is_false_positive(body, check_type, content_type, response.headers, status):
                     return False, url, status  # Skip silently - it's a false positive
                 
                 safe_print(f"{RED}[!!!] {check_type} FOUND (200) -> {url}{NC}")
@@ -1580,47 +1629,60 @@ def print_summary():
 
 
 def main():
+    BAN = f"""{CYAN}
+    ██████╗ ██╗   ██╗ ██████╗██╗  ██╗
+    ██╔══██╗██║   ██║██╔════╝██║ ██╔╝
+    ██████╔╝██║   ██║██║     █████╔╝ 
+    ██╔══██╗██║   ██║██║     ██╔═██╗ 
+    ██████╔╝╚██████╔╝╚██████╗██║  ██╗
+    ╚═════╝  ╚═════╝  ╚═════╝╚═╝  ╚═╝
+                {RED}Scanner v3.0{NC}
+"""
     parser = argparse.ArgumentParser(
-        description="Enhanced Cloud Bucket & Misconfiguration Scanner v3.0",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Target flags (required - pick one):
-  -org uber             Scan 'uber' as org (auto-TLD + permutations)
-  -org uber.com         Scan specific domain
-  -org https://x.com    Scan specific URL
-  -list targets.txt     Batch scan from file (one target per line)
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+        description=f"{BAN}\n{GREEN} Enhanced Cloud Bucket & Misconfiguration Scanner{NC}\n{YELLOW} ================================================================={NC}",
+        epilog=f"""
+{CYAN}TARGET FLAGS (Required - pick one):{NC}
+  {GREEN}-org <target>{NC}         Scan org (auto-TLD + permutations)
+  {GREEN}-list <file>{NC}          Batch scan from file (one target per line)
 
-Check category flags (optional - pick one or more):
-  -p                    Port-based checks only (DB panels, infra dashboards)
-  -b                    Cloud bucket + Firebase checks only
-  -w                    Web app vulnerability checks only (git, env, swagger, etc.)
-  -s                    SaaS & third-party integration checks only
+{CYAN}CHECK CATEGORIES (Optional - pick one or more):{NC}
+  {GREEN}-p{NC}                    Port-based checks only (DB panels, infra dashboards)
+  {GREEN}-b{NC}                    Cloud bucket + Firebase checks only
+  {GREEN}-w{NC}                    Web app vulnerability checks only (git, env, swagger)
+  {GREEN}-s{NC}                    SaaS & third-party integration checks only
+  
+  {YELLOW}* If NO category flag is given, ALL checks run by default.{NC}
 
-  If NO category flag is given, ALL checks run by default.
+{CYAN}GENERAL OPTIONS:{NC}
+  {GREEN}-o <prefix>{NC}           Output file prefix (default: auto-generated)
+  {GREEN}-h, --help{NC}            Show this beautiful help message and exit
 
-Smart grouping (auto with -list):
+{CYAN}SMART GROUPING:{NC}
   Targets auto-grouped by root company. Bucket/SaaS run ONCE per company.
   Web/port checks run per unique subdomain. Duplicates are skipped.
-  e.g. dev.walmart.com + api.walmart.com = 1 bucket scan, 2 web scans.
+  e.g. {YELLOW}dev.walmart.com + api.walmart.com = 1 bucket scan, 2 web scans.{NC}
 
-Examples:
-  python bucket_finder.py -org uber                 Run ALL checks on uber
-  python bucket_finder.py -org uber -p              Port scan only
-  python bucket_finder.py -list subs.txt            Smart grouped full scan
-  python bucket_finder.py -list subs.txt -p         Ports only, grouped
-  python bucket_finder.py -list ips.txt -p -w       Ports + web on IPs
-        """
+{CYAN}EXAMPLES:{NC}
+  {GREEN}python buck.py -org uber{NC}                 Run ALL checks on uber
+  {GREEN}python buck.py -org uber -p{NC}              Port scan only
+  {GREEN}python buck.py -list subs.txt{NC}            Smart grouped full scan
+  {GREEN}python buck.py -list subs.txt -p{NC}         Ports only, grouped
+"""
     )
-    parser.add_argument("-org", dest="org", help="Single target: company name, domain, or URL")
-    parser.add_argument("-list", dest="listfile", help="File with targets (one per line)")
-    parser.add_argument("-p", dest="ports", action="store_true", help="Port-based checks (DBs, infra dashboards)")
-    parser.add_argument("-b", dest="buckets", action="store_true", help="Cloud bucket + Firebase checks")
-    parser.add_argument("-w", dest="web", action="store_true", help="Web app vulns (git, env, swagger, debug)")
-    parser.add_argument("-s", dest="saas", action="store_true", help="SaaS & third-party checks")
-    parser.add_argument("-o", dest="output", help="Output file prefix (default: auto-generated)", default=None)
+    
+    parser.add_argument("-org", dest="org", help=argparse.SUPPRESS)
+    parser.add_argument("-list", dest="listfile", help=argparse.SUPPRESS)
+    parser.add_argument("-p", dest="ports", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-b", dest="buckets", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-w", dest="web", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-s", dest="saas", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-o", dest="output", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # Backward compat positional
-    parser.add_argument("target", nargs="?", help="Target (backward compat, same as -org)")
+    parser.add_argument("target", nargs="?", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
