@@ -1,0 +1,666 @@
+from burp import IBurpExtender, ITab, IContextMenuFactory, IMessageEditorController
+import java.lang
+from javax.swing import JPanel, JCheckBox, JTextField, JLabel, JTable, JScrollPane, BorderFactory, SwingUtilities, JMenuItem, JButton, JSplitPane, JTabbedPane, JOptionPane
+from javax.swing.table import DefaultTableModel
+from javax.swing.event import ListSelectionListener, DocumentListener
+from java.awt.event import ItemListener
+import java.awt as java_awt
+from java.util import ArrayList
+from threading import Thread
+import re
+import base64
+import hashlib
+from java.io import PrintWriter
+
+class MessageController(IMessageEditorController):
+    def __init__(self, helpers):
+        self._http_service = None
+        self._request = None
+        self._response = None
+
+    def getHttpService(self): return self._http_service
+    def getRequest(self): return self._request
+    def getResponse(self): return self._response
+
+class TableSelectionListener(ListSelectionListener):
+    def __init__(self, extender):
+        self.extender = extender
+        
+    def valueChanged(self, event):
+        if not event.getValueIsAdjusting():
+            view_row = self.extender.results_table.getSelectedRow()
+            if view_row != -1:
+                model_row = self.extender.results_table.convertRowIndexToModel(view_row)
+                
+                if model_row < len(self.extender.displayed_records):
+                    record = self.extender.displayed_records[model_row]
+                    
+                    self.extender.controller._http_service = record['http_service']
+                    self.extender.controller._request = record['orig_req_bytes']
+                    self.extender.controller._response = record['orig_resp_bytes']
+                    
+                    self.extender.orig_req_viewer.setMessage(record['orig_req_bytes'], True)
+                    if record['orig_resp_bytes']:
+                        self.extender.orig_resp_viewer.setMessage(record['orig_resp_bytes'], False)
+                    else:
+                        self.extender.orig_resp_viewer.setMessage(self.extender._helpers.stringToBytes(""), False)
+                        
+                    self.extender.mod_req_viewer.setMessage(record['mod_req_bytes'], True)
+                    if record['mod_resp_bytes']:
+                        self.extender.mod_resp_viewer.setMessage(record['mod_resp_bytes'], False)
+                    else:
+                        self.extender.mod_resp_viewer.setMessage(self.extender._helpers.stringToBytes(""), False)
+
+class SettingSaver(DocumentListener, ItemListener):
+    def __init__(self, extender): self.e = extender
+    def insertUpdate(self, event): self.e.save_settings()
+    def removeUpdate(self, event): self.e.save_settings()
+    def changedUpdate(self, event): self.e.save_settings()
+    def itemStateChanged(self, event): self.e.save_settings()
+
+class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
+    
+    def registerExtenderCallbacks(self, callbacks):
+        self._callbacks = callbacks
+        self._helpers = callbacks.getHelpers()
+        
+        callbacks.setExtensionName("AuthSurgical (Ultimate Pro Version)")
+        
+        self._stdout = PrintWriter(callbacks.getStdout(), True)
+        self._stderr = PrintWriter(callbacks.getStderr(), True)
+        
+        self.master_history_cache = []
+        self.displayed_records = []
+        self.current_filter = "all"
+        self.processed_signatures = set()
+        
+        self.init_ui()
+        self.load_settings()
+        self.setup_listeners()
+        
+        callbacks.addSuiteTab(self)
+        callbacks.registerContextMenuFactory(self)
+        
+        self._stdout.println("AuthSurgical UI Tab and Context Menu loaded successfully via Legacy API!")
+
+    def getTabCaption(self):
+        return "AuthSurgical"
+
+    def getUiComponent(self):
+        return self.ui_panel
+
+    def init_ui(self):
+        self.main_tabs = JTabbedPane()
+        
+        # ==========================================
+        # TAB 1: SETTINGS ENGINE
+        # ==========================================
+        settings_panel = JPanel(java_awt.BorderLayout())
+        settings_panel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15))
+        
+        control_panel = JPanel(java_awt.GridLayout(9, 2, 10, 10))
+        control_panel.setBorder(BorderFactory.createTitledBorder("Surgical Manipulation & API IDOR Controls"))
+        
+        self.chk_drop_cookie = JCheckBox("Strip 'Cookie' Headers")
+        self.chk_drop_auth = JCheckBox("Strip 'Authorization' Headers")
+        self.chk_json_only = JCheckBox("Filter: JSON Responses Only (On-Execution)")
+        self.chk_enable_priv_esc = JCheckBox("Enable Token Injection (PrivEsc/Unauth)")
+        self.chk_enable_idor = JCheckBox("Enable IDOR Auto Match & Replace Engine")
+        self.chk_enable_tamper = JCheckBox("Tamper HTTP Method (e.g., POST -> PUT/PATCH)")
+        self.chk_enable_mass_assign = JCheckBox("Inject Admin/Debug Params (?admin=true)")
+        self.chk_enable_rest_path = JCheckBox("Enable REST Path IDOR Matching (/api/v1/user/1002)")
+        self.chk_enable_b64_jwt = JCheckBox("Auto Decode & Mutate Base64 / JWT Parameters")
+        self.chk_enable_ip_spoof = JCheckBox("Enable Localhost / Internal IP Spoofing Spray")
+        
+        self.txt_custom_auth = JTextField(20)
+        self.txt_custom_cookie = JTextField(20)
+        self.txt_idor_key = JTextField(15)
+        self.txt_idor_val = JTextField(15)
+        self.txt_tamper_method = JTextField("PUT", 7)
+        self.txt_spoof_ip = JTextField("127.0.0.1", 15)
+        
+        control_panel.add(self.chk_drop_cookie)
+        control_panel.add(self.chk_drop_auth)
+        control_panel.add(self.chk_json_only)
+        control_panel.add(self.chk_enable_priv_esc)
+        control_panel.add(self.chk_enable_idor)
+        control_panel.add(self.chk_enable_mass_assign)
+        control_panel.add(self.chk_enable_rest_path)
+        control_panel.add(self.chk_enable_b64_jwt)
+        control_panel.add(self.chk_enable_ip_spoof)
+        control_panel.add(self.chk_enable_tamper)
+        
+        JPanel_row5 = JPanel(java_awt.FlowLayout(java_awt.FlowLayout.LEFT, 0, 0))
+        JPanel_row5.add(JLabel("Target Method Verb: "))
+        JPanel_row5.add(self.txt_tamper_method)
+        JPanel_row5.add(JLabel("   |   Spoof Target IP Address: "))
+        JPanel_row5.add(self.txt_spoof_ip)
+        
+        input_panel = JPanel(java_awt.GridLayout(4, 2, 10, 10))
+        input_panel.setBorder(BorderFactory.createTitledBorder("Payload Mapping Fields"))
+        input_panel.add(JLabel("Custom Auth Payload:"))
+        input_panel.add(self.txt_custom_auth)
+        input_panel.add(JLabel("Custom Cookie Payload:"))
+        input_panel.add(self.txt_custom_cookie)
+        input_panel.add(JLabel("IDOR Match Parameter Key Name / URL String Pattern:"))
+        input_panel.add(self.txt_idor_key)
+        input_panel.add(JLabel("IDOR Replace Target Value:"))
+        input_panel.add(self.txt_idor_val)
+        
+        north_settings_container = JPanel(java_awt.BorderLayout(0, 15))
+        north_settings_container.add(control_panel, java_awt.BorderLayout.NORTH)
+        north_settings_container.add(JPanel_row5, java_awt.BorderLayout.CENTER)
+        north_settings_container.add(input_panel, java_awt.BorderLayout.SOUTH)
+        
+        settings_panel.add(north_settings_container, java_awt.BorderLayout.NORTH)
+        
+        # ==========================================
+        # TAB 2: DASHBOARD
+        # ==========================================
+        dashboard_panel = JPanel(java_awt.BorderLayout())
+        
+        filter_toolbar = JPanel(java_awt.FlowLayout(java_awt.FlowLayout.LEFT, 10, 5))
+        filter_toolbar.setBorder(BorderFactory.createTitledBorder("Live View Filters (Applies to current history grid)"))
+        
+        btn_filter_idor = JButton("Filter IDOR Candidates (IDs in URL/Body)")
+        btn_filter_json = JButton("Show Only JSON Requests")
+        btn_reset_view = JButton("Reset View (Show All Captured)")
+        btn_clear_history = JButton("Clear Dashboard & Cache")
+        
+        btn_filter_idor.addActionListener(lambda event: self.apply_live_filter("idor"))
+        btn_filter_json.addActionListener(lambda event: self.apply_live_filter("json"))
+        btn_reset_view.addActionListener(lambda event: self.apply_live_filter("all"))
+        btn_clear_history.addActionListener(lambda event: self.clear_history())
+        
+        filter_toolbar.add(btn_filter_idor)
+        filter_toolbar.add(btn_filter_json)
+        filter_toolbar.add(btn_reset_view)
+        filter_toolbar.add(btn_clear_history)
+        
+        columns = ["Target URL", "Method", "Orig Len", "Surg Len", "Status Transition", "Vulnerability Signal / Flag"]
+        self.table_model = DefaultTableModel(columns, 0)
+        self.results_table = JTable(self.table_model)
+        self.results_table.getSelectionModel().addListSelectionListener(TableSelectionListener(self))
+        scroll_pane = JScrollPane(self.results_table)
+        scroll_pane.setBorder(BorderFactory.createTitledBorder("Surgical Response Analyser Output"))
+        
+        table_panel = JPanel(java_awt.BorderLayout())
+        table_panel.add(filter_toolbar, java_awt.BorderLayout.NORTH)
+        table_panel.add(scroll_pane, java_awt.BorderLayout.CENTER)
+        
+        self.controller = MessageController(self._helpers)
+        self.orig_req_viewer = self._callbacks.createMessageEditor(self.controller, False)
+        self.orig_resp_viewer = self._callbacks.createMessageEditor(self.controller, False)
+        self.mod_req_viewer = self._callbacks.createMessageEditor(self.controller, False)
+        self.mod_resp_viewer = self._callbacks.createMessageEditor(self.controller, False)
+        
+        viewer_tabs = JTabbedPane()
+        viewer_tabs.addTab("Original Request", self.orig_req_viewer.getComponent())
+        viewer_tabs.addTab("Original Response", self.orig_resp_viewer.getComponent())
+        viewer_tabs.addTab("Surgical Request", self.mod_req_viewer.getComponent())
+        viewer_tabs.addTab("Surgical Response", self.mod_resp_viewer.getComponent())
+        
+        split_pane = JSplitPane(JSplitPane.VERTICAL_SPLIT, table_panel, viewer_tabs)
+        split_pane.setResizeWeight(0.5)
+        split_pane.setContinuousLayout(True)
+        split_pane.setOneTouchExpandable(True)
+        
+        dashboard_panel.add(split_pane, java_awt.BorderLayout.CENTER)
+        
+        self.main_tabs.addTab("Dashboard (Live Traffic)", dashboard_panel)
+        self.main_tabs.addTab("Settings Engine", settings_panel)
+        self.ui_panel = self.main_tabs
+
+    def setup_listeners(self):
+        saver = SettingSaver(self)
+        self.txt_custom_auth.getDocument().addDocumentListener(saver)
+        self.txt_custom_cookie.getDocument().addDocumentListener(saver)
+        self.txt_idor_key.getDocument().addDocumentListener(saver)
+        self.txt_idor_val.getDocument().addDocumentListener(saver)
+        self.txt_tamper_method.getDocument().addDocumentListener(saver)
+        self.txt_spoof_ip.getDocument().addDocumentListener(saver)
+        
+        self.chk_drop_cookie.addItemListener(saver)
+        self.chk_drop_auth.addItemListener(saver)
+        self.chk_json_only.addItemListener(saver)
+        self.chk_enable_priv_esc.addItemListener(saver)
+        self.chk_enable_idor.addItemListener(saver)
+        self.chk_enable_tamper.addItemListener(saver)
+        self.chk_enable_mass_assign.addItemListener(saver)
+        self.chk_enable_rest_path.addItemListener(saver)
+        self.chk_enable_b64_jwt.addItemListener(saver)
+        self.chk_enable_ip_spoof.addItemListener(saver)
+
+    def save_settings(self):
+        try:
+            self._callbacks.saveExtensionSetting("txt_custom_auth", self.txt_custom_auth.getText())
+            self._callbacks.saveExtensionSetting("txt_custom_cookie", self.txt_custom_cookie.getText())
+            self._callbacks.saveExtensionSetting("txt_idor_key", self.txt_idor_key.getText())
+            self._callbacks.saveExtensionSetting("txt_idor_val", self.txt_idor_val.getText())
+            self._callbacks.saveExtensionSetting("txt_tamper_method", self.txt_tamper_method.getText())
+            self._callbacks.saveExtensionSetting("txt_spoof_ip", self.txt_spoof_ip.getText())
+            
+            self._callbacks.saveExtensionSetting("chk_drop_cookie", str(self.chk_drop_cookie.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_drop_auth", str(self.chk_drop_auth.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_json_only", str(self.chk_json_only.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_priv_esc", str(self.chk_enable_priv_esc.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_idor", str(self.chk_enable_idor.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_tamper", str(self.chk_enable_tamper.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_mass_assign", str(self.chk_enable_mass_assign.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_rest_path", str(self.chk_enable_rest_path.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_b64_jwt", str(self.chk_enable_b64_jwt.isSelected()))
+            self._callbacks.saveExtensionSetting("chk_enable_ip_spoof", str(self.chk_enable_ip_spoof.isSelected()))
+        except Exception:
+            pass
+
+    def load_settings(self):
+        try:
+            val = self._callbacks.loadExtensionSetting("txt_custom_auth")
+            if val is not None: self.txt_custom_auth.setText(val)
+            val = self._callbacks.loadExtensionSetting("txt_custom_cookie")
+            if val is not None: self.txt_custom_cookie.setText(val)
+            val = self._callbacks.loadExtensionSetting("txt_idor_key")
+            if val is not None: self.txt_idor_key.setText(val)
+            val = self._callbacks.loadExtensionSetting("txt_idor_val")
+            if val is not None: self.txt_idor_val.setText(val)
+            val = self._callbacks.loadExtensionSetting("txt_tamper_method")
+            if val is not None: self.txt_tamper_method.setText(val)
+            val = self._callbacks.loadExtensionSetting("txt_spoof_ip")
+            if val is not None: self.txt_spoof_ip.setText(val)
+            
+            val = self._callbacks.loadExtensionSetting("chk_drop_cookie")
+            if val == "True": self.chk_drop_cookie.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_drop_auth")
+            if val == "True": self.chk_drop_auth.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_json_only")
+            if val == "True": self.chk_json_only.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_priv_esc")
+            if val == "True": self.chk_enable_priv_esc.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_idor")
+            if val == "True": self.chk_enable_idor.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_tamper")
+            if val == "True": self.chk_enable_tamper.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_mass_assign")
+            if val == "True": self.chk_enable_mass_assign.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_rest_path")
+            if val == "True": self.chk_enable_rest_path.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_b64_jwt")
+            if val == "True": self.chk_enable_b64_jwt.setSelected(True)
+            val = self._callbacks.loadExtensionSetting("chk_enable_ip_spoof")
+            if val == "True": self.chk_enable_ip_spoof.setSelected(True)
+        except Exception:
+            pass
+
+    def createMenuItems(self, invocation):
+        menu_items = ArrayList()
+        
+        messages = invocation.getSelectedMessages()
+        if messages and len(messages) > 0:
+            menu_item_all = JMenuItem("Send to AuthSurgical (Use UI Settings)")
+            menu_item_all.addActionListener(lambda event: self.process_selected_requests(messages, "all"))
+            
+            menu_item_idor = JMenuItem("Send to AuthSurgical (IDOR Only)")
+            menu_item_idor.addActionListener(lambda event: self.process_selected_requests(messages, "idor"))
+            
+            menu_item_priv = JMenuItem("Send to AuthSurgical (Privilege Esc Only)")
+            menu_item_priv.addActionListener(lambda event: self.process_selected_requests(messages, "priv"))
+            
+            menu_items.add(menu_item_all)
+            menu_items.add(menu_item_idor)
+            menu_items.add(menu_item_priv)
+            
+        return menu_items
+
+    def process_selected_requests(self, selected_items, mode):
+        Thread(target=lambda: self.worker_thread_execution(selected_items, mode)).start()
+
+    def worker_thread_execution(self, selected_items, mode="all"):
+        if not self.validate_preflight_settings(mode):
+            return
+            
+        for item in selected_items:
+            # 1. Construct modified request
+            modified_request_bytes, do_drop, orig_req_bytes, orig_resp_bytes, orig_len, is_json_only_skip, method, url_str, path = self.construct_surgical_request(item, mode)
+            
+            if is_json_only_skip:
+                continue
+                
+            # 2. Smart Deduplication
+            if self.is_duplicate_attack(method, url_str, orig_req_bytes, mode):
+                continue
+                
+            # 3. Execute Attack & Evaluate
+            row_entry = self.execute_network_attack(item.getHttpService(), modified_request_bytes, orig_req_bytes, orig_resp_bytes, orig_len, method, url_str, path)
+            
+            # 4. Append to UI safely without clearing table
+            self.append_to_dashboard(row_entry)
+
+    def validate_preflight_settings(self, mode):
+        idor_key = self.txt_idor_key.getText().strip()
+        idor_val = self.txt_idor_val.getText().strip()
+        target_ip = self.txt_spoof_ip.getText().strip()
+        custom_auth = self.txt_custom_auth.getText().strip()
+        custom_cookie = self.txt_custom_cookie.getText().strip()
+        
+        do_idor = (mode == "idor") or (mode == "all" and self.chk_enable_idor.isSelected())
+        do_rest = (mode == "idor") or (mode == "all" and self.chk_enable_rest_path.isSelected())
+        do_priv = (mode == "priv") or (mode == "all" and self.chk_enable_priv_esc.isSelected())
+        do_spoof = (mode == "all" and self.chk_enable_ip_spoof.isSelected())
+        
+        if (do_idor or do_rest) and (not idor_key or not idor_val):
+            SwingUtilities.invokeLater(lambda: JOptionPane.showMessageDialog(self.ui_panel, "Please configure IDOR Match Parameter Key and Replace Target Value in AuthSurgical Settings first!", "AuthSurgical Validation Error", JOptionPane.ERROR_MESSAGE))
+            return False
+            
+        if do_priv and not custom_auth and not custom_cookie:
+            SwingUtilities.invokeLater(lambda: JOptionPane.showMessageDialog(self.ui_panel, "Please configure Custom Auth Payload or Custom Cookie Payload in AuthSurgical Settings first!", "AuthSurgical Validation Error", JOptionPane.ERROR_MESSAGE))
+            return False
+            
+        if do_spoof and not target_ip:
+            SwingUtilities.invokeLater(lambda: JOptionPane.showMessageDialog(self.ui_panel, "Please configure a Spoof Target IP Address in AuthSurgical Settings first!", "AuthSurgical Validation Error", JOptionPane.ERROR_MESSAGE))
+            return False
+            
+        return True
+
+    def is_duplicate_attack(self, method, url_str, req_bytes, mode):
+        idor_k = self.txt_idor_key.getText().strip()
+        idor_v = self.txt_idor_val.getText().strip()
+        auth = self.txt_custom_auth.getText().strip()
+        cook = self.txt_custom_cookie.getText().strip()
+        tamp = self.txt_tamper_method.getText().strip()
+        spoof = self.txt_spoof_ip.getText().strip()
+        body_str = self._helpers.bytesToString(req_bytes)
+        
+        raw_sig = "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
+            mode, method, url_str, body_str, idor_k, idor_v, auth, cook, tamp, spoof
+        )
+        sig_hash = hashlib.md5(raw_sig.encode('utf-8')).hexdigest()
+        
+        if sig_hash in self.processed_signatures:
+            return True
+            
+        self.processed_signatures.add(sig_hash)
+        return False
+
+    def construct_surgical_request(self, item, mode):
+        request_info = self._helpers.analyzeRequest(item)
+        request_bytes = item.getRequest()
+        original_response_bytes = item.getResponse()
+        
+        orig_len = 0
+        is_json_only_skip = False
+        
+        if original_response_bytes:
+            orig_len = len(original_response_bytes) - self._helpers.analyzeResponse(original_response_bytes).getBodyOffset()
+
+        if self.chk_json_only.isSelected():
+            is_json = False
+            if original_response_bytes:
+                orig_resp_info = self._helpers.analyzeResponse(original_response_bytes)
+                for header in orig_resp_info.getHeaders():
+                    if header.lower().startswith("content-type:") and "json" in header.lower():
+                        is_json = True
+                        break
+            if not is_json:
+                for header in request_info.getHeaders():
+                    if header.lower().startswith("accept:") and "json" in header.lower():
+                        is_json = True
+                        break
+            if not is_json and not str(request_info.getUrl()).lower().endswith(".json"):
+                is_json_only_skip = True
+                return None, False, None, None, 0, True, "", "", ""
+
+        headers = list(request_info.getHeaders())
+        method = headers[0].split(" ")[0]
+        path = headers[0].split(" ")[1]
+        http_version = headers[0].split(" ")[2]
+        url_str = str(request_info.getUrl())
+        
+        body_offset = request_info.getBodyOffset()
+        body_bytes = request_bytes[body_offset:]
+        body_str = self._helpers.bytesToString(body_bytes)
+
+        # Apply transformations
+        do_idor = (mode == "idor") or (mode == "all" and self.chk_enable_idor.isSelected())
+        do_rest = (mode == "idor") or (mode == "all" and self.chk_enable_rest_path.isSelected())
+        do_priv = (mode == "priv") or (mode == "all" and self.chk_enable_priv_esc.isSelected())
+        do_spoof = (mode == "all" and self.chk_enable_ip_spoof.isSelected())
+        do_tamper = (mode == "all" and self.chk_enable_tamper.isSelected())
+        do_drop_cookie = (mode == "all" and self.chk_drop_cookie.isSelected())
+        do_drop_auth = (mode == "all" and self.chk_drop_auth.isSelected())
+        
+        idor_key = self.txt_idor_key.getText().strip()
+        idor_val = self.txt_idor_val.getText().strip()
+        tamper_verb = self.txt_tamper_method.getText().strip().upper()
+        target_ip = self.txt_spoof_ip.getText().strip()
+        custom_auth = self.txt_custom_auth.getText().strip()
+        custom_cookie = self.txt_custom_cookie.getText().strip()
+
+        if do_tamper and tamper_verb:
+            method = tamper_verb
+
+        if self.chk_enable_mass_assign.isSelected() and mode == "all":
+            common_params = "admin=true&role=admin&debug=1"
+            if "?" in path:
+                path = path + "&" + common_params
+            else:
+                path = path + "?" + common_params
+
+            if body_str and body_str.strip().startswith("{"):
+                modified_json_body = body_str.strip()
+                modified_json_body = '{"admin": true, "role": "admin", ' + modified_json_body[1:]
+                body_str = modified_json_body
+
+        if do_rest and idor_key and idor_val:
+            path = self.process_rest_path(path, idor_key, idor_val)
+
+        if do_idor and idor_key and idor_val:
+            if "?" in path:
+                path_without_query, query = path.split("?", 1)
+                updated_query = self.process_idor_string(query, idor_key, idor_val)
+                path = path_without_query + "?" + updated_query
+
+            if body_str:
+                is_body_json = False
+                for header in headers:
+                    if header.lower().startswith("content-type:") and "json" in header.lower():
+                        is_body_json = True
+                        break
+                if is_body_json:
+                    body_str = self.process_idor_json(body_str, idor_key, idor_val)
+                else:
+                    body_str = self.process_idor_string(body_str, idor_key, idor_val)
+
+        headers[0] = "{} {} {}".format(method, path, http_version)
+
+        new_headers = []
+        spoof_headers_to_purge = [
+            "x-forwarded-for:", "x-forwarded:", "x-real-ip:", "x-client-ip:", 
+            "client-ip:", "true-client-ip:", "x-originating-ip:", "x-remote-ip:"
+        ]
+        
+        for header in headers:
+            header_lower = header.lower()
+            if do_drop_cookie and header_lower.startswith("cookie:"): continue
+            if do_drop_auth and header_lower.startswith("authorization:"): continue
+            if do_spoof and any(header_lower.startswith(p) for p in spoof_headers_to_purge): continue
+            if do_priv and (header_lower.startswith("authorization:") or header_lower.startswith("cookie:")): continue
+            new_headers.append(header)
+
+        if do_spoof and target_ip:
+            new_headers.append("X-Forwarded-For: " + target_ip)
+            new_headers.append("X-Forwarded: " + target_ip)
+            new_headers.append("X-Real-IP: " + target_ip)
+            new_headers.append("X-Client-IP: " + target_ip)
+            new_headers.append("Client-IP: " + target_ip)
+            new_headers.append("True-Client-IP: " + target_ip)
+            new_headers.append("X-Originating-IP: " + target_ip)
+            new_headers.append("X-Remote-IP: " + target_ip)
+
+        if do_priv:
+            if custom_auth: new_headers.append("Authorization: " + custom_auth)
+            if custom_cookie: new_headers.append("Cookie: " + custom_cookie)
+
+        modified_request_bytes = self._helpers.buildHttpMessage(new_headers, self._helpers.stringToBytes(body_str))
+        
+        return modified_request_bytes, False, request_bytes, original_response_bytes, orig_len, False, method, url_str, path
+
+    def execute_network_attack(self, http_service, modified_request_bytes, orig_req_bytes, orig_resp_bytes, orig_len, method, url_str, path):
+        row_entry = {
+            "url": url_str, "method": method, "orig_len": orig_len, "surg_len": 0, 
+            "status_str": "?? -> ??", "signal": "Executing...",
+            "req_path_query": path, "resp_body": "", "is_json_type": False,
+            "http_service": http_service, "orig_req_bytes": orig_req_bytes, 
+            "orig_resp_bytes": orig_resp_bytes, "mod_req_bytes": modified_request_bytes, "mod_resp_bytes": None
+        }
+        
+        try:
+            action_result = self._callbacks.makeHttpRequest(http_service, modified_request_bytes)
+            surg_response_bytes = action_result.getResponse()
+            row_entry["mod_resp_bytes"] = surg_response_bytes
+            
+            surg_len = 0
+            status = 0
+            resp_body_str = ""
+            is_resp_json = False
+            
+            if surg_response_bytes:
+                surg_resp_info = self._helpers.analyzeResponse(surg_response_bytes)
+                surg_len = len(surg_response_bytes) - surg_resp_info.getBodyOffset()
+                status = surg_resp_info.getStatusCode()
+                resp_body_str = self._helpers.bytesToString(surg_response_bytes[surg_resp_info.getBodyOffset():])
+                for header in surg_resp_info.getHeaders():
+                    if header.lower().startswith("content-type:") and "json" in header.lower():
+                        is_resp_json = True
+                        break
+            
+            orig_status = 0
+            if orig_resp_bytes:
+                orig_status = self._helpers.analyzeResponse(orig_resp_bytes).getStatusCode()
+                
+            status_str = "{} -> {}".format(orig_status if orig_status else "??", status)
+
+            signal = "Clean / Restricted"
+            if status == 200 or status == 201:
+                if orig_len > 0 and surg_len == orig_len:
+                    signal = "CRITICAL: EXACT LENGTH MATCH (Bypass Potential)"
+                elif orig_len > 0 and abs(surg_len - orig_len) < 20:
+                    signal = "HIGH ALERT: Close Length Match"
+                else:
+                    signal = "Review: Status 200 with Variant Length"
+            elif status == 401 or status == 403:
+                signal = "Secure (Inaccessible)"
+
+            row_entry["surg_len"] = surg_len
+            row_entry["status_str"] = status_str
+            row_entry["signal"] = signal
+            row_entry["resp_body"] = resp_body_str
+            row_entry["is_json_type"] = is_resp_json
+
+        except Exception as e:
+            self._stderr.println("Network execution failed: " + str(e))
+            row_entry["signal"] = "ERROR: Connection Failed / Timeout"
+            row_entry["status_str"] = "ERROR"
+
+        return row_entry
+
+    def append_to_dashboard(self, row_entry):
+        self.master_history_cache.append(row_entry)
+        
+        # Check if it matches the current filter
+        filter_mode = self.current_filter
+        
+        idor_signature_regex = re.compile(r'(\b\w*(id|uuid|guid|account|user|doc|file)\w*\b\s*[:=]\s*["\']?[a-zA-Z0-9\-_]{2,}["\']?)', re.IGNORECASE)
+        
+        matches = True
+        if filter_mode == "json" and not row_entry["is_json_type"]:
+            matches = False
+        if filter_mode == "idor":
+            contains_id_pattern = bool(idor_signature_regex.search(row_entry["req_path_query"]) or idor_signature_regex.search(row_entry["resp_body"]))
+            if not contains_id_pattern:
+                matches = False
+                
+        if matches:
+            self.displayed_records.append(row_entry)
+            SwingUtilities.invokeLater(lambda: self.table_model.addRow([
+                row_entry["url"], row_entry["method"], row_entry["orig_len"], 
+                row_entry["surg_len"], row_entry["status_str"], row_entry["signal"]
+            ]))
+
+    def clear_history(self):
+        self.master_history_cache = []
+        self.displayed_records = []
+        self.processed_signatures.clear()
+        
+        SwingUtilities.invokeLater(lambda: self.table_model.setRowCount(0))
+        
+        try:
+            self.controller._http_service = None
+            self.controller._request = None
+            self.controller._response = None
+            self.orig_req_viewer.setMessage(self._helpers.stringToBytes(""), False)
+            self.orig_resp_viewer.setMessage(self._helpers.stringToBytes(""), False)
+            self.mod_req_viewer.setMessage(self._helpers.stringToBytes(""), False)
+            self.mod_resp_viewer.setMessage(self._helpers.stringToBytes(""), False)
+        except Exception:
+            pass
+
+    def apply_live_filter(self, filter_mode):
+        self.current_filter = filter_mode
+        self.table_model.setRowCount(0)
+        self.displayed_records = []
+        
+        idor_signature_regex = re.compile(r'(\b\w*(id|uuid|guid|account|user|doc|file)\w*\b\s*[:=]\s*["\']?[a-zA-Z0-9\-_]{2,}["\']?)', re.IGNORECASE)
+        
+        for record in self.master_history_cache:
+            if filter_mode == "json" and not record["is_json_type"]:
+                continue
+            
+            if filter_mode == "idor":
+                contains_id_pattern = bool(idor_signature_regex.search(record["req_path_query"]) or idor_signature_regex.search(record["resp_body"]))
+                if not contains_id_pattern:
+                    continue
+                    
+            self.displayed_records.append(record)
+            self.table_model.addRow([record["url"], record["method"], record["orig_len"], record["surg_len"], record["status_str"], record["signal"]])
+
+    def mutate_b64_jwt_string(self, value_str, replacement_val):
+        if not self.chk_enable_b64_jwt.isSelected(): return replacement_val
+        try:
+            base64.b64decode(value_str)
+            return base64.b64encode(str(replacement_val).encode()).decode()
+        except Exception: pass
+        if value_str.count('.') == 2:
+            try:
+                parts = value_str.split('.')
+                padding = "=" * ((4 - len(parts[1]) % 4) % 4)
+                payload_decoded = base64.b64decode(parts[1] + padding).decode()
+                updated_payload = re.sub(r'("\b\w+\b"\s*:\s*)(\d+|"[^"]*")', r'\1"' + str(replacement_val) + '"', payload_decoded)
+                parts[1] = base64.b64encode(updated_payload.encode()).decode().replace("=", "")
+                return ".".join(parts)
+            except Exception: pass
+        return replacement_val
+
+    def process_idor_string(self, target_str, key, replacement_val):
+        pattern = r'({}=)([^&]*)'.format(re.escape(key))
+        match = re.search(pattern, target_str, re.IGNORECASE)
+        if match:
+            current_val = match.group(2)
+            mutated_val = self.mutate_b64_jwt_string(current_val, replacement_val)
+            return re.sub(pattern, r'\g<1>' + mutated_val, target_str, flags=re.IGNORECASE)
+        return target_str
+
+    def process_idor_json(self, json_str, key, replacement_val):
+        pattern = r'("{}"\s*:\s*)("[^"]*"|\d+|true|false|null)'.format(re.escape(key))
+        def json_replacer(match):
+            prefix = match.group(1)
+            original_val = match.group(2).strip('"')
+            mutated_val = self.mutate_b64_jwt_string(original_val, replacement_val)
+            if match.group(2).startswith('"'): return '{}"{}"'.format(prefix, mutated_val)
+            return '{}{}'.format(prefix, mutated_val)
+        return re.sub(pattern, json_replacer, json_str, flags=re.IGNORECASE)
+
+    def process_rest_path(self, path_str, key, replacement_val):
+        pattern = r'(/{}/)([^/?#]+)'.format(re.escape(key))
+        if re.search(pattern, path_str, re.IGNORECASE):
+            return re.sub(pattern, r'\g<1>' + str(replacement_val), path_str, flags=re.IGNORECASE)
+        return path_str
